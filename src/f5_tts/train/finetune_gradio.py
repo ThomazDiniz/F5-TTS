@@ -801,9 +801,9 @@ def create_metadata(name_project, ch_tokenizer, progress=gr.Progress()):
             print(f"Error processing {file_audio}: {e}")
             continue
 
-        if duration < 1 or duration > 25:
-            if duration > 25:
-                error_files.append([file_audio, "duration > 25 sec"])
+        if duration < 1 or duration > 30:
+            if duration > 30:
+                error_files.append([file_audio, "duration > 30 sec"])
             if duration < 1:
                 error_files.append([file_audio, "duration < 1 sec "])
             continue
