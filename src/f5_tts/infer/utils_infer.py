@@ -282,6 +282,31 @@ def remove_silence_edges(audio, silence_threshold=-42):
 
 def preprocess_ref_audio_text(ref_audio_orig, ref_text, clip_short=True, show_info=print, device=device):
     show_info("Converting audio...")
+    
+    # Handle Gradio 3.x audio input - it returns a tuple (sample_rate, audio_data) instead of filepath
+    if isinstance(ref_audio_orig, tuple):
+        sample_rate, audio_data = ref_audio_orig
+        # Convert numpy array to temporary file
+        if isinstance(audio_data, np.ndarray):
+            # Ensure audio_data is 1D and float32
+            if len(audio_data.shape) > 1:
+                audio_data = audio_data.flatten()
+            # Normalize to [-1, 1] range if needed
+            if audio_data.dtype != np.float32:
+                if audio_data.max() > 1.0 or audio_data.min() < -1.0:
+                    # Assume int16 range
+                    audio_data = audio_data.astype(np.float32) / 32767.0
+                else:
+                    audio_data = audio_data.astype(np.float32)
+            # Create temporary file with audio data
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+                # Convert to tensor and add channel dimension if needed
+                audio_tensor = torch.from_numpy(audio_data)
+                if len(audio_tensor.shape) == 1:
+                    audio_tensor = audio_tensor.unsqueeze(0)
+                torchaudio.save(temp_audio.name, audio_tensor, sample_rate)
+                ref_audio_orig = temp_audio.name
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
         aseg = AudioSegment.from_file(ref_audio_orig)
 

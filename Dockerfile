@@ -83,6 +83,9 @@ RUN git submodule update --init --recursive \
 # The fallback (librosa) works perfectly fine for audio processing
 RUN echo "Skipping torchcodec installation - transformers will use librosa fallback (recommended workaround)"
 
+# Install tensorboard for logging support
+RUN pip install --no-cache-dir tensorboard
+
 # Ensure FFmpeg libraries from conda are found first
 ENV LD_LIBRARY_PATH=/opt/conda/lib:/usr/lib/x86_64-linux-gnu:/usr/lib:/lib/x86_64-linux-gnu:/lib:${LD_LIBRARY_PATH}
 ENV SHELL=/bin/bash

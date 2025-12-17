@@ -31,6 +31,17 @@ from f5_tts.api import F5TTS
 from f5_tts.model.utils import convert_char_to_pinyin
 from f5_tts.infer.utils_infer import transcribe
 from importlib.resources import files
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# Import tensorboard com fallback
+try:
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
+    EventAccumulator = None
 
 
 training_process = None
@@ -436,6 +447,17 @@ def start_training(
         fp16 = f"--mixed_precision={mixed_precision}"
     else:
         fp16 = ""
+
+    # Convert numeric values to appropriate types (int for integer args, float for float args)
+    batch_size_per_gpu = int(batch_size_per_gpu) if batch_size_per_gpu is not None else 1000
+    max_samples = int(max_samples) if max_samples is not None else 64
+    grad_accumulation_steps = int(grad_accumulation_steps) if grad_accumulation_steps is not None else 1
+    epochs = int(epochs) if epochs is not None else 10
+    num_warmup_updates = int(num_warmup_updates) if num_warmup_updates is not None else 2
+    save_per_updates = int(save_per_updates) if save_per_updates is not None else 300
+    last_per_steps = int(last_per_steps) if last_per_steps is not None else 100
+    learning_rate = float(learning_rate) if learning_rate is not None else 1e-5
+    max_grad_norm = float(max_grad_norm) if max_grad_norm is not None else 1.0
 
     cmd = (
         f"accelerate launch {fp16} {file_train} --exp_name {exp_name} "
@@ -974,13 +996,13 @@ def calculate_train(
         learning_rate = 7.5e-5
 
     return (
-        batch_size_per_gpu,
-        max_samples,
-        num_warmup_updates,
-        save_per_updates,
-        last_per_steps,
-        samples,
-        learning_rate,
+        int(batch_size_per_gpu),
+        int(max_samples),
+        int(num_warmup_updates),
+        int(save_per_updates),
+        int(last_per_steps),
+        int(samples),
+        float(learning_rate),
         int(epochs),
     )
 
@@ -1207,6 +1229,10 @@ def infer(
 
     if not os.path.isfile(file_checkpoint):
         return None, "checkpoint not found!"
+    
+    # Converter nfe_step para int (Gradio pode retornar como float)
+    nfe_step = int(nfe_step) if nfe_step is not None else 32
+    seed = int(seed) if seed is not None else -1
 
     if training_process is not None:
         device_test = "cpu"
@@ -1361,13 +1387,142 @@ def get_combined_stats():
     return combined_stats
 
 
-def get_audio_select(file_sample):
-    select_audio_ref = file_sample
-    select_audio_gen = file_sample
+def plot_training_metrics(project_name, logger_type="tensorboard", exp_name="F5TTS_Base"):
+    """Plot training loss and learning rate from logs"""
+    if project_name is None or project_name == "":
+        return None
+    
+    project_name = project_name.replace("_pinyin", "").replace("_char", "")
+    
+    try:
+        if logger_type == "tensorboard" and not TENSORBOARD_AVAILABLE:
+            return None
+        
+        if logger_type == "tensorboard":
+            # Procurar logs do Tensorboard
+            # Os logs são salvos em runs/{exp_name} (ex: runs/F5TTS_Base)
+            runs_dir = os.path.join(os.getcwd(), "runs")
+            if not os.path.exists(runs_dir):
+                return None
+            
+            # Procurar pelo exp_name primeiro, depois pelo projeto
+            log_dirs = []
+            if exp_name and os.path.exists(os.path.join(runs_dir, exp_name)):
+                exp_dir = os.path.join(runs_dir, exp_name)
+                # Pode haver subdiretórios com timestamps
+                if os.path.isdir(exp_dir):
+                    for item in os.listdir(exp_dir):
+                        item_path = os.path.join(exp_dir, item)
+                        if os.path.isdir(item_path):
+                            log_dirs.append(item_path)
+                    if not log_dirs:
+                        log_dirs = [exp_dir]
+            
+            # Se não encontrou, procurar por qualquer diretório relacionado ao projeto
+            if not log_dirs:
+                all_dirs = [os.path.join(runs_dir, d) for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+                # Filtrar por projeto ou exp_name
+                log_dirs = [d for d in all_dirs if project_name.lower() in os.path.basename(d).lower() or (exp_name and exp_name.lower() in os.path.basename(d).lower())]
+            
+            if not log_dirs:
+                return None
+            
+            # Usar o diretório mais recente
+            latest_log_dir = sorted(log_dirs, key=lambda x: os.path.getmtime(x), reverse=True)[0]
+            
+            if not os.path.exists(latest_log_dir):
+                return None
+            
+            # Ler eventos do Tensorboard
+            try:
+                ea = EventAccumulator(latest_log_dir)
+                ea.Reload()
+            except Exception:
+                return None
+            
+            # Obter escalares
+            if "scalars" not in ea.Tags():
+                return None
+            
+            scalar_tags = ea.Tags()["scalars"]
+            
+            if "loss" not in scalar_tags and "lr" not in scalar_tags:
+                return None
+            
+            # Extrair dados
+            loss_data = []
+            lr_data = []
+            
+            if "loss" in scalar_tags:
+                try:
+                    loss_events = ea.Scalars("loss")
+                    loss_data = [(e.step, e.value) for e in loss_events]
+                except Exception:
+                    pass
+            
+            if "lr" in scalar_tags:
+                try:
+                    lr_events = ea.Scalars("lr")
+                    lr_data = [(e.step, e.value) for e in lr_events]
+                except Exception:
+                    pass
+            
+            if not loss_data and not lr_data:
+                return None
+            
+            # Criar gráfico
+            fig, axes = plt.subplots(2 if loss_data and lr_data else 1, 1, figsize=(10, 6 if loss_data and lr_data else 4))
+            if not isinstance(axes, np.ndarray):
+                axes = [axes]
+            
+            plot_idx = 0
+            
+            if loss_data:
+                steps, losses = zip(*loss_data)
+                axes[plot_idx].plot(steps, losses, 'b-', linewidth=2, label='Loss')
+                axes[plot_idx].set_xlabel('Step')
+                axes[plot_idx].set_ylabel('Loss', color='b')
+                axes[plot_idx].tick_params(axis='y', labelcolor='b')
+                axes[plot_idx].grid(True, alpha=0.3)
+                axes[plot_idx].set_title('Training Loss')
+                axes[plot_idx].legend()
+                plot_idx += 1
+            
+            if lr_data:
+                steps, lrs = zip(*lr_data)
+                axes[plot_idx].plot(steps, lrs, 'r-', linewidth=2, label='Learning Rate')
+                axes[plot_idx].set_xlabel('Step')
+                axes[plot_idx].set_ylabel('Learning Rate', color='r')
+                axes[plot_idx].tick_params(axis='y', labelcolor='r')
+                axes[plot_idx].grid(True, alpha=0.3)
+                axes[plot_idx].set_title('Learning Rate Schedule')
+                axes[plot_idx].legend()
+            
+            plt.tight_layout()
+            return fig
+        
+        elif logger_type == "wandb":
+            # Para Wandb, seria necessário usar a API
+            # Por enquanto, retornar None e adicionar suporte depois
+            return None
+            
+    except Exception as e:
+        print(f"Error plotting metrics: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    
+    return None
 
-    if file_sample is not None:
-        select_audio_ref += "_ref.wav"
-        select_audio_gen += "_gen.wav"
+
+def get_audio_select(file_sample):
+    select_audio_ref = None
+    select_audio_gen = None
+
+    if file_sample and file_sample.strip():
+        # Construir caminhos apenas se file_sample for válido
+        select_audio_ref = file_sample + "_ref.wav"
+        select_audio_gen = file_sample + "_gen.wav"
 
     return select_audio_ref, select_audio_gen
 
@@ -1424,7 +1579,7 @@ Skip this step if you have your dataset, metadata.csv, and a folder wavs with al
                 visible=False,
             )
 
-            audio_speaker = gr.File(label="Voice", type="filepath", file_count="multiple")
+            audio_speaker = gr.File(label="Voice", file_count="multiple")
             txt_lang = gr.Text(label="Language", value="English")
             bt_transcribe = bt_create = gr.Button("Transcribe")
             txt_info_transcribe = gr.Text(label="Info", value="")
@@ -1439,7 +1594,7 @@ Skip this step if you have your dataset, metadata.csv, and a folder wavs with al
 
             with gr.Row():
                 random_text_transcribe = gr.Text(label="Text")
-                random_audio_transcribe = gr.Audio(label="Audio", type="filepath")
+                random_audio_transcribe = gr.Audio(label="Audio")
 
             random_sample_transcribe.click(
                 fn=get_random_sample_transcribe,
@@ -1522,7 +1677,7 @@ Skip this step if you have your dataset, raw.arrow, duration.json, and vocab.txt
 
             with gr.Row():
                 random_text_prepare = gr.Text(label="Tokenizer")
-                random_audio_prepare = gr.Audio(label="Audio", type="filepath")
+                random_audio_prepare = gr.Audio(label="Audio")
 
             random_sample_prepare.click(
                 fn=get_random_sample_prepare, inputs=[cm_project], outputs=[random_text_prepare, random_audio_prepare]
@@ -1612,15 +1767,43 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
 
             ch_stream = gr.Checkbox(label="Stream Output Experiment", value=True)
             txt_info_train = gr.Text(label="Info", value="")
+            
+            # Training metrics plot
+            with gr.Row():
+                bt_refresh_plot = gr.Button("Refresh Training Metrics", variant="secondary")
+                training_plot = gr.Plot(label="Training Metrics (Loss & Learning Rate)")
+            
+            # Atualizar gráfico quando clicar no botão ou mudar o projeto
+            bt_refresh_plot.click(
+                fn=lambda proj, logger, exp: plot_training_metrics(proj, logger, exp),
+                inputs=[cm_project, cd_logger, exp_name],
+                outputs=[training_plot]
+            )
+            cm_project.change(
+                fn=lambda proj, logger, exp: plot_training_metrics(proj, logger, exp),
+                inputs=[cm_project, cd_logger, exp_name],
+                outputs=[training_plot]
+            )
+            cd_logger.change(
+                fn=lambda proj, logger, exp: plot_training_metrics(proj, logger, exp),
+                inputs=[cm_project, cd_logger, exp_name],
+                outputs=[training_plot]
+            )
+            exp_name.change(
+                fn=lambda proj, logger, exp: plot_training_metrics(proj, logger, exp),
+                inputs=[cm_project, cd_logger, exp_name],
+                outputs=[training_plot]
+            )
 
             list_audios, select_audio = get_audio_project(projects_selelect, False)
 
-            select_audio_ref = select_audio
-            select_audio_gen = select_audio
+            select_audio_ref = None
+            select_audio_gen = None
 
-            if select_audio is not None:
-                select_audio_ref += "_ref.wav"
-                select_audio_gen += "_gen.wav"
+            if select_audio and select_audio.strip():
+                # Construir caminhos completos apenas se select_audio for válido
+                select_audio_ref = select_audio + "_ref.wav"
+                select_audio_gen = select_audio + "_gen.wav"
 
             with gr.Row():
                 ch_list_audio = gr.Dropdown(
@@ -1636,8 +1819,8 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                 cm_project.change(fn=get_audio_project, inputs=[cm_project], outputs=[ch_list_audio])
 
             with gr.Row():
-                audio_ref_stream = gr.Audio(label="Original", type="filepath", value=select_audio_ref)
-                audio_gen_stream = gr.Audio(label="Generate", type="filepath", value=select_audio_gen)
+                audio_ref_stream = gr.Audio(label="Original", value=select_audio_ref)
+                audio_gen_stream = gr.Audio(label="Generate", value=select_audio_gen)
 
             ch_list_audio.change(
                 fn=get_audio_select,
@@ -1761,7 +1944,7 @@ SOS: Check the use_ema setting (True or False) for your model to see what works 
             random_sample_infer = gr.Button("Random Sample")
 
             ref_text = gr.Textbox(label="Ref Text")
-            ref_audio = gr.Audio(label="Audio Ref", type="filepath")
+            ref_audio = gr.Audio(label="Audio Ref")
             gen_text = gr.Textbox(label="Gen Text")
 
             random_sample_infer.click(
@@ -1773,7 +1956,7 @@ SOS: Check the use_ema setting (True or False) for your model to see what works 
                 seed_info = gr.Text(label="Seed :")
                 check_button_infer = gr.Button("Infer")
 
-            gen_audio = gr.Audio(label="Audio Gen", type="filepath")
+            gen_audio = gr.Audio(label="Audio Gen")
 
             check_button_infer.click(
                 fn=infer,

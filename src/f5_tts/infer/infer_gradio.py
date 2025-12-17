@@ -186,7 +186,7 @@ with gr.Blocks() as app_credits:
 """)
 with gr.Blocks() as app_tts:
     gr.Markdown("# Batched TTS")
-    ref_audio_input = gr.Audio(label="Reference Audio", type="filepath")
+    ref_audio_input = gr.Audio(label="Reference Audio")
     gen_text_input = gr.Textbox(label="Text to Generate", lines=10)
     generate_btn = gr.Button("Synthesize", variant="primary")
     with gr.Accordion("Advanced Settings", open=False):
@@ -332,7 +332,7 @@ with gr.Blocks() as app_multistyle:
         with gr.Column():
             regular_name = gr.Textbox(value="Regular", label="Speech Type Name")
             regular_insert = gr.Button("Insert Label", variant="secondary")
-        regular_audio = gr.Audio(label="Regular Reference Audio", type="filepath")
+        regular_audio = gr.Audio(label="Regular Reference Audio")
         regular_ref_text = gr.Textbox(label="Reference Text (Regular)", lines=2)
 
     # Regular speech type (max 100)
@@ -351,7 +351,7 @@ with gr.Blocks() as app_multistyle:
                 name_input = gr.Textbox(label="Speech Type Name")
                 delete_btn = gr.Button("Delete Type", variant="secondary")
                 insert_btn = gr.Button("Insert Label", variant="secondary")
-            audio_input = gr.Audio(label="Reference Audio", type="filepath")
+            audio_input = gr.Audio(label="Reference Audio")
             ref_text_input = gr.Textbox(label="Reference Text", lines=2)
         speech_type_rows.append(row)
         speech_type_names.append(name_input)
@@ -581,7 +581,7 @@ Have a conversation with an AI using your reference voice!
     with chat_interface_container:
         with gr.Row():
             with gr.Column():
-                ref_audio_chat = gr.Audio(label="Reference Audio", type="filepath")
+                ref_audio_chat = gr.Audio(label="Reference Audio")
             with gr.Column():
                 with gr.Accordion("Advanced Settings", open=False):
                     remove_silence_chat = gr.Checkbox(
@@ -605,7 +605,6 @@ Have a conversation with an AI using your reference voice!
             with gr.Column():
                 audio_input_chat = gr.Microphone(
                     label="Speak your message",
-                    type="filepath",
                 )
                 audio_output_chat = gr.Audio(autoplay=True)
             with gr.Column():
