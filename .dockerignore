@@ -1,0 +1,28 @@
+# Git and env
+.git
+.gitignore
+.env
+.venv
+venv
+*.egg-info
+__pycache__
+.pytest_cache
+.mypy_cache
+
+# Data and ckpts (mount at run if needed)
+data/
+ckpts/
+*.pt
+*.safetensors
+
+# IDE and OS
+.idea
+.vscode
+*.swp
+.DS_Store
+Thumbs.db
+
+# Docs and scripts (optional; remove if you need them in image)
+# HOW_TO_RUN.md
+# install.bat
+# run_*.bat

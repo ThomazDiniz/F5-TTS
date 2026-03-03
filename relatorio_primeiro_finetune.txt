@@ -1,0 +1,100 @@
+================================================================================
+  RELATÓRIO DO PRIMEIRO TESTE DE FINETUNE — F5-TTS (CoLingPB)
+================================================================================
+Data do relatório: Março 2025
+Projeto: F5-TTS-FirstPixelToTRAIN
+
+--------------------------------------------------------------------------------
+1. PROJETO E DADOS
+--------------------------------------------------------------------------------
+  Projeto (nome do experimento):  brpb01_g2af01_char
+  Arquivos de áudio para treino:   brpb01_g2af01
+  Tokenizer:                      char (inferido pelo sufixo _char do projeto)
+  Checkpoint base:                 firstpixelptbr (model_last.pt)
+
+--------------------------------------------------------------------------------
+2. CONFIGURAÇÕES UTILIZADAS
+--------------------------------------------------------------------------------
+  Finetune:                       Sim (habilitado)
+  Model:                          F5TTS_Base
+  Path to the Pretrained Checkpoint:  /workspace/F5-TTS/ckpts/firstpixelptbr/model_last.pt
+  Tokenizer File:                 (vazio — uso de tokenizer char)
+
+  Learning Rate:                  0,00001 (1e-5)
+  Batch Size per GPU:             1000
+  Batch Size Type:                frame
+  Max Samples:                    64
+  Gradient Accumulation Steps:    1
+  Max Gradient Norm:              1
+
+  (Demais parâmetros — Epochs, Save per Updates, Last per Steps, Warmup, etc. —
+   conforme configurados na interface do finetune no momento do teste.)
+
+--------------------------------------------------------------------------------
+3. CODIFICAÇÃO DOS INFORMANTES — CoLingPB (Corpus Linguístico da Paraíba)
+--------------------------------------------------------------------------------
+  A codificação dos informantes do CoLingPB segue o formato:
+
+    brPB / 25 / _g1 / a / F / 01
+
+  Onde:
+
+  • País e UF:  brPB
+
+  • Código do município:
+    01 – João Pessoa        02 – Mamanguape      03 – Belém
+    04 – Guarabira          05 – Itabaiana      06 – Esperança
+    07 – Campina Grande     08 – Umbuzeiro      09 – Cuité
+    10 – Barra de Santa Rosa  11 – Picuí        12 – Soledade
+    13 – Cabaceiras         14 – Serra Branca  15 – Congo
+    16 – Taperoá            17 – Monteiro       18 – Patos
+    19 – Catingueira        20 – Catolé do Rocha  21 – Pombal
+    22 – Princesa Isabel     23 – Sousa         24 – Itaporanga
+    25 – Cajazeiras         26 – Conceição
+
+  • Grupo do informante:
+    g1    – adolescente (14–17 anos)
+    g2    – adulto (25–45 anos)
+    g2 u  – adulto graduado (25–45 anos)
+    g3    – idoso (60+ anos)
+    g3 u  – idoso graduado (60+ anos)
+    a     – zona urbana
+    b     – zona rural
+
+  • Sexo do informante:  F – feminino;  M – masculino
+
+  • Número do informante:  01, 02, 03, ...
+
+--------------------------------------------------------------------------------
+4. DECODIFICAÇÃO PELO NOME DO PROJETO
+--------------------------------------------------------------------------------
+  Nome do projeto:  brpb01_g2af01_char
+
+  O sufixo "_char" indica apenas o tokenizer (caractere); a codificação do
+  informante está em:  brpb01_g2af01
+
+  Decodificação campo a campo:
+
+    brpb   →  brPB (país e UF: Brasil / Paraíba)
+    01     →  município 01 — João Pessoa
+    g2     →  grupo g2 — adulto (25–45 anos)
+    a      →  zona urbana
+    f      →  F — feminino
+    01     →  número do informante 01
+
+  Em formato CoLingPB:  brPB / 01 / _g2 / a / F / 01
+
+  Resumo em texto:
+    Informante do Corpus Linguístico da Paraíba (CoLingPB): João Pessoa (01),
+    adulta (g2), zona urbana (a), sexo feminino (F), informante número 01.
+
+--------------------------------------------------------------------------------
+5. OBSERVAÇÕES
+--------------------------------------------------------------------------------
+  Este relatório descreve o primeiro teste de finetune do F5-TTS com dados
+  do CoLingPB, utilizando o checkpoint firstpixelptbr e o projeto
+  brpb01_g2af01_char (áudios brpb01_g2af01).
+
+================================================================================
+  Fim do relatório
+================================================================================

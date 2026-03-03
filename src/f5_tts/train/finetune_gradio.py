@@ -1,6 +1,8 @@
+import logging
 import threading
 import queue
 import re
+import sys
 
 import gc
 import json
@@ -11,10 +13,23 @@ import random
 import signal
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from glob import glob
+
+# Suppress Gradio "please upgrade" message (we pin 3.x on purpose)
+class _StderrFilter:
+    def __init__(self, stderr):
+        self._stderr = stderr
+    def write(self, msg):
+        if "IMPORTANT" in msg and "please upgrade" in msg:
+            return
+        self._stderr.write(msg)
+    def flush(self):
+        self._stderr.flush()
+    def __getattr__(self, name):
+        return getattr(self._stderr, name)
+sys.stderr = _StderrFilter(sys.stderr)
 
 import click
 import gradio as gr
@@ -685,6 +700,8 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
 
     num = 0
     error_num = 0
+    error_details = []  # list of (file_segment, error_msg) for logging and summary
+    max_errors_logged = 20  # cap detailed errors in return message
     data = ""
     for file_audio in progress.tqdm(file_audios, desc="transcribe files", total=len((file_audios))):
         audio, _ = librosa.load(file_audio, sr=24000, mono=True)
@@ -707,14 +724,22 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
                 data += f"{name_segment}|{text}\n"
 
                 num += 1
-            except:  # noqa: E722
+            except Exception as e:  # noqa: BLE001
                 error_num += 1
+                err_msg = f"{type(e).__name__}: {e}"
+                logging.exception("Transcribe failed for %s: %s", file_segment, err_msg)
+                error_details.append((file_segment, err_msg))
 
     with open(file_metadata, "w", encoding="utf-8-sig") as f:
         f.write(data)
 
-    if error_num != []:
+    if error_num != 0:
         error_text = f"\nerror files : {error_num}"
+        if error_details:
+            summary_lines = [f"  - {path}: {msg}" for path, msg in error_details[:max_errors_logged]]
+            error_text += "\n\nFirst errors:\n" + "\n".join(summary_lines)
+            if len(error_details) > max_errors_logged:
+                error_text += f"\n  ... and {len(error_details) - max_errors_logged} more (see logs)."
     else:
         error_text = ""
 
@@ -1424,7 +1449,7 @@ Skip this step if you have your dataset, metadata.csv, and a folder wavs with al
                 visible=False,
             )
 
-            audio_speaker = gr.File(label="Voice", type="filepath", file_count="multiple")
+            audio_speaker = gr.File(label="Voice", type="file", file_count="multiple")
             txt_lang = gr.Text(label="Language", value="English")
             bt_transcribe = bt_create = gr.Button("Transcribe")
             txt_info_transcribe = gr.Text(label="Info", value="")

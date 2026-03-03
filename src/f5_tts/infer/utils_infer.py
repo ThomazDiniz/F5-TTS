@@ -150,6 +150,7 @@ def initialize_asr_pipeline(device: str = device, dtype=None):
         model="openai/whisper-large-v3-turbo",
         torch_dtype=dtype,
         device=device,
+        ignore_warning=True,
     )
 
 
