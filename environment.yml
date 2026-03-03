@@ -1,0 +1,15 @@
+# Conda environment: f5-tts
+# Create:  conda env create -f environment.yml
+# Activate: conda activate f5-tts
+# Update:   conda env update -f environment.yml --prune
+# Remove:  conda env remove -n f5-tts
+#
+# After create: install PyTorch (see README for CUDA/ROCm URLs), then: pip install -e .
+
+name: f5-tts
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
