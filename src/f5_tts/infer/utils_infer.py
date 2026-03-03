@@ -11,8 +11,6 @@ import re
 import tempfile
 from importlib.resources import files
 
-import librosa
-import soundfile as sf
 import matplotlib
 
 matplotlib.use("Agg")
@@ -152,32 +150,18 @@ def initialize_asr_pipeline(device: str = device, dtype=None):
         model="openai/whisper-large-v3-turbo",
         torch_dtype=dtype,
         device=device,
-        ignore_warning=True,
     )
 
 
 # transcribe
-# Whisper expects 16 kHz. We load audio ourselves and pass array to avoid torchcodec
-# (torchcodec requires PyTorch 2.5+ register_fake and breaks on older installs).
-WHISPER_SAMPLE_RATE = 16000
 
 
 def transcribe(ref_audio, language=None):
     global asr_pipe
     if asr_pipe is None:
         initialize_asr_pipeline(device=device)
-    # Load with soundfile + resample to 16k so pipeline never uses torchcodec (file path)
-    if isinstance(ref_audio, str) and os.path.isfile(ref_audio):
-        audio, sr = sf.read(ref_audio, dtype="float32")
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-        if sr != WHISPER_SAMPLE_RATE:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=WHISPER_SAMPLE_RATE)
-        inputs = {"array": audio, "sampling_rate": WHISPER_SAMPLE_RATE}
-    else:
-        inputs = ref_audio
     return asr_pipe(
-        inputs,
+        ref_audio,
         chunk_length_s=30,
         batch_size=128,
         generate_kwargs={"task": "transcribe", "language": language} if language else {"task": "transcribe"},
@@ -366,7 +350,6 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, clip_short=True, show_in
         audio_data = audio_file.read()
         audio_hash = hashlib.md5(audio_data).hexdigest()
 
-    ref_text = ref_text or ""
     if not ref_text.strip():
         global _ref_audio_cache
         if audio_hash in _ref_audio_cache:

@@ -22,11 +22,7 @@
 ## Installation
 
 ```bash
-# Option A: create env from environment.yml (recommended)
-conda env create -f environment.yml
-conda activate f5-tts
-
-# Option B: create env manually
+# Create a python 3.10 conda env (you could also use virtualenv)
 conda create -n f5-tts python=3.10
 conda activate f5-tts
 

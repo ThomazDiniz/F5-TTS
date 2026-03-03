@@ -1,7 +1,6 @@
 import threading
 import queue
 import re
-import traceback
 
 import gc
 import json
@@ -114,13 +113,11 @@ def save_settings(
 
 # Load settings from a JSON file
 def load_settings(project_name):
-    if project_name is None or not str(project_name).strip():
-        project_name = ""
-    project_name = str(project_name).replace("_pinyin", "").replace("_char", "").strip()
+    project_name = project_name.replace("_pinyin", "").replace("_char", "")
     path_project = os.path.join(path_project_ckpts, project_name)
     file_setting = os.path.join(path_project, "setting.json")
 
-    if not project_name or not os.path.isfile(file_setting):
+    if not os.path.isfile(file_setting):
         settings = {
             "exp_name": "F5TTS_Base",
             "learning_rate": 1e-05,
@@ -710,7 +707,6 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
 
     num = 0
     error_num = 0
-    error_details = []  # list of (file_segment, exception_message) for logging
     data = ""
     for file_audio in progress.tqdm(file_audios, desc="transcribe files", total=len((file_audios))):
         audio, _ = librosa.load(file_audio, sr=24000, mono=True)
@@ -733,22 +729,14 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
                 data += f"{name_segment}|{text}\n"
 
                 num += 1
-            except Exception as e:  # noqa: E722
+            except:  # noqa: E722
                 error_num += 1
-                err_msg = f"{type(e).__name__}: {e}"
-                error_details.append((file_segment, err_msg))
-                traceback.print_exc()
 
     with open(file_metadata, "w", encoding="utf-8-sig") as f:
         f.write(data)
 
-    if error_num > 0:
+    if error_num != []:
         error_text = f"\nerror files : {error_num}"
-        max_show = 15
-        for i, (seg_path, msg) in enumerate(error_details[:max_show]):
-            error_text += f"\n  [{i+1}] {os.path.basename(seg_path)}: {msg}"
-        if len(error_details) > max_show:
-            error_text += f"\n  ... and {len(error_details) - max_show} more (see terminal/console for full traceback)"
     else:
         error_text = ""
 
@@ -1312,26 +1300,19 @@ def get_checkpoints_project(project_name, is_gradio=True):
 
 
 def get_audio_project(project_name, is_gradio=True):
-    if project_name is None or not str(project_name).strip():
-        return gr.update(choices=[], value=None) if is_gradio else ([], None)
-    project_name = str(project_name).replace("_pinyin", "").replace("_char", "").strip()
-    if not project_name:
-        return gr.update(choices=[], value=None) if is_gradio else ([], None)
+    if project_name is None:
+        return [], ""
+    project_name = project_name.replace("_pinyin", "").replace("_char", "")
 
-    files_audios = []
-    project_samples_dir = os.path.join(path_project_ckpts, project_name, "samples")
-    if os.path.isdir(path_project_ckpts) and os.path.isdir(project_samples_dir):
-        files_audios = glob(os.path.join(project_samples_dir, "*_gen.wav"))
-        try:
-            files_audios = sorted(
-                files_audios,
-                key=lambda x: int(os.path.basename(x).split("_")[1].split(".")[0])
-            )
-        except (IndexError, ValueError):
-            files_audios = sorted(files_audios)
-        files_audios = [item.replace("_gen.wav", "") for item in files_audios]
+    if os.path.isdir(path_project_ckpts):
+        files_audios = glob(os.path.join(path_project_ckpts, project_name, "samples", "*.wav"))
+        files_audios = sorted(files_audios, key=lambda x: int(os.path.basename(x).split("_")[1].split(".")[0]))
 
-    selelect_checkpoint = files_audios[0] if files_audios else None
+        files_audios = [item.replace("_gen.wav", "") for item in files_audios if item.endswith("_gen.wav")]
+    else:
+        files_audios = []
+
+    selelect_checkpoint = None if not files_audios else files_audios[0]
 
     if is_gradio:
         return gr.update(choices=files_audios, value=selelect_checkpoint)
@@ -2042,7 +2023,7 @@ Reduce the model size from 5GB to 1.3GB. The new checkpoint can be used for infe
 def main(port, host, share, api):
     global app
     print("Starting app...")
-    app.queue(api_open=api).launch(server_name=host, server_port=port, share=share)
+    app.queue(api_open=api).launch(server_name=host, server_port=port, share=share, show_api=api)
 
 
 if __name__ == "__main__":
