@@ -160,15 +160,39 @@ class Trainer:
             return 0
 
         self.accelerator.wait_for_everyone()
-        if "model_last.pt" in os.listdir(self.checkpoint_path):
-            latest_checkpoint = "model_last.pt"
+        all_pt = [f for f in os.listdir(self.checkpoint_path) if f.endswith(".pt")]
+        # Prefer model_last.pt, then latest model_XXXXX.pt by step
+        def _step_from_name(x):
+            n = "".join(filter(str.isdigit, x))
+            return int(n) if n else 0
+
+        if "model_last.pt" in all_pt:
+            candidates = ["model_last.pt"] + sorted(
+                [f for f in all_pt if f != "model_last.pt"],
+                key=_step_from_name,
+                reverse=True,
+            )
         else:
-            latest_checkpoint = sorted(
-                [f for f in os.listdir(self.checkpoint_path) if f.endswith(".pt")],
-                key=lambda x: int("".join(filter(str.isdigit, x))),
-            )[-1]
-        # checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", map_location=self.accelerator.device)  # rather use accelerator.load_state ಥ_ಥ
-        checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", weights_only=True, map_location="cpu")
+            candidates = sorted(all_pt, key=_step_from_name, reverse=True)
+
+        checkpoint = None
+        latest_checkpoint = None
+        for ckpt_name in candidates:
+            path = f"{self.checkpoint_path}/{ckpt_name}"
+            try:
+                checkpoint = torch.load(path, weights_only=True, map_location="cpu")
+                latest_checkpoint = ckpt_name
+                if self.is_main:
+                    print(f"Loaded checkpoint: {ckpt_name}")
+                break
+            except (RuntimeError, OSError) as e:
+                if self.is_main:
+                    print(f"Skip corrupted/incomplete checkpoint {ckpt_name}: {e}")
+                continue
+        if checkpoint is None:
+            if self.is_main:
+                print("No valid checkpoint found, starting from step 0.")
+            return 0
 
         # patch for backward compatibility, 305e3ea
         for key in ["ema_model.mel_spec.mel_stft.mel_scale.fb", "ema_model.mel_spec.mel_stft.spectrogram.window"]:

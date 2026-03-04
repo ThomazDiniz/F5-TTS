@@ -136,7 +136,7 @@ def load_settings(project_name):
             "last_per_steps": 100,
             "finetune": True,
             "file_checkpoint_train": "",
-            "tokenizer_type": "pinyin",
+            "tokenizer_type": "char",
             "tokenizer_file": "",
             "mixed_precision": "none",
             "logger": "wandb",
@@ -397,7 +397,7 @@ def start_training(
     last_per_steps=800,
     finetune=True,
     file_checkpoint_train="",
-    tokenizer_type="pinyin",
+    tokenizer_type="char",
     tokenizer_file="",
     mixed_precision="fp16",
     stream=False,
@@ -451,6 +451,15 @@ def start_training(
         fp16 = f"--mixed_precision={mixed_precision}"
     else:
         fp16 = ""
+
+    # CLI expects int for these args (Gradio may pass float)
+    batch_size_per_gpu = int(batch_size_per_gpu)
+    max_samples = int(max_samples)
+    grad_accumulation_steps = int(grad_accumulation_steps)
+    epochs = int(epochs)
+    num_warmup_updates = int(num_warmup_updates)
+    save_per_updates = int(save_per_updates)
+    last_per_steps = int(last_per_steps)
 
     cmd = (
         f"accelerate launch {fp16} {file_train} --exp_name {exp_name} "
@@ -1415,7 +1424,7 @@ For tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
 
     with gr.Row():
         projects, projects_selelect = get_list_projects()
-        tokenizer_type = gr.Radio(label="Tokenizer Type", choices=["pinyin", "char", "custom"], value="pinyin")
+        tokenizer_type = gr.Radio(label="Tokenizer Type", choices=["pinyin", "char", "custom"], value="char")
         project_name = gr.Textbox(label="Project Name", value="my_speak")
         bt_create = gr.Button("Create a New Project")
 
@@ -1450,7 +1459,7 @@ Skip this step if you have your dataset, metadata.csv, and a folder wavs with al
             )
 
             audio_speaker = gr.File(label="Voice", type="file", file_count="multiple")
-            txt_lang = gr.Text(label="Language", value="English")
+            txt_lang = gr.Text(label="Language", value="portuguese")
             bt_transcribe = bt_create = gr.Button("Transcribe")
             txt_info_transcribe = gr.Text(label="Info", value="")
             bt_transcribe.click(

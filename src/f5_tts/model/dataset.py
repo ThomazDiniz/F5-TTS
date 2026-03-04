@@ -1,4 +1,5 @@
 import json
+import os
 import random
 from importlib.resources import files
 
@@ -130,22 +131,33 @@ class CustomDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-        while True:
+        tried = 0
+        while tried < len(self.data):
             row = self.data[index]
             audio_path = row["audio_path"]
             text = row["text"]
             duration = row["duration"]
 
             # filter by given length
-            if 0.3 <= duration <= 30:
-                break  # valid
+            if not (0.3 <= duration <= 30):
+                index = (index + 1) % len(self.data)
+                tried += 1
+                continue
+            # skip missing audio files (e.g. failed transcription or deleted wavs)
+            if not os.path.isfile(audio_path):
+                index = (index + 1) % len(self.data)
+                tried += 1
+                continue
 
-            index = (index + 1) % len(self.data)
-
-        if self.preprocessed_mel:
-            mel_spec = torch.tensor(row["mel_spec"])
-        else:
-            audio, source_sample_rate = torchaudio.load(audio_path)
+            if self.preprocessed_mel:
+                mel_spec = torch.tensor(row["mel_spec"])
+                return {"mel_spec": mel_spec, "text": text}
+            try:
+                audio, source_sample_rate = torchaudio.load(audio_path)
+            except (RuntimeError, OSError):
+                index = (index + 1) % len(self.data)
+                tried += 1
+                continue
 
             # make sure mono input
             if audio.shape[0] > 1:
@@ -159,11 +171,14 @@ class CustomDataset(Dataset):
             # to mel spectrogram
             mel_spec = self.mel_spectrogram(audio)
             mel_spec = mel_spec.squeeze(0)  # '1 d t -> d t'
+            return {
+                "mel_spec": mel_spec,
+                "text": text,
+            }
 
-        return {
-            "mel_spec": mel_spec,
-            "text": text,
-        }
+        raise FileNotFoundError(
+            f"No valid sample found in dataset (all {len(self.data)} entries missing or invalid duration)."
+        )
 
 
 # Dynamic Batch Sampler
