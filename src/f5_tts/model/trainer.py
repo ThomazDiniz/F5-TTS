@@ -29,6 +29,7 @@ class Trainer:
         learning_rate,
         num_warmup_updates=20000,
         save_per_updates=1000,
+        save_every_epochs=0,
         checkpoint_path=None,
         batch_size=32,
         batch_size_type: str = "sample",
@@ -102,6 +103,7 @@ class Trainer:
         self.epochs = epochs
         self.num_warmup_updates = num_warmup_updates
         self.save_per_updates = save_per_updates
+        self.save_every_epochs = save_every_epochs if save_every_epochs else 0
         self.last_per_steps = default(last_per_steps, save_per_updates * grad_accumulation_steps)
         self.checkpoint_path = default(checkpoint_path, "ckpts/test_e2-tts")
 
@@ -146,10 +148,15 @@ class Trainer:
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
             if last:
+                print(f"Saving last checkpoint at step {step} (may take a minute for large files)...", flush=True)
                 self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
-                print(f"Saved last checkpoint at step {step}")
+                print(f"Saved last checkpoint at step {step}", flush=True)
             else:
+                print(f"Saving checkpoint at step {step}...", flush=True)
                 self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_{step}.pt")
+            del checkpoint
+            gc.collect()
+        self.accelerator.wait_for_everyone()
 
     def load_checkpoint(self):
         if (
@@ -227,7 +234,9 @@ class Trainer:
         gc.collect()
         return step
 
-    def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
+    def train(self, train_dataset: Dataset, num_workers=12, resumable_with_seed: int = None):
+        if self.accelerator.is_local_main_process:
+            print("[trainer] train() started: preparing dataloader and scheduler...", flush=True)
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -285,21 +294,42 @@ class Trainer:
         self.scheduler = SequentialLR(
             self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_steps]
         )
+        if self.accelerator.is_local_main_process:
+            print("[trainer] Preparing dataloader and scheduler with accelerator...", flush=True)
         train_dataloader, self.scheduler = self.accelerator.prepare(
             train_dataloader, self.scheduler
         )  # actual steps = 1 gpu steps / gpus
+        if self.accelerator.is_local_main_process:
+            print("[trainer] Loading checkpoint (resume)...", flush=True)
         start_step = self.load_checkpoint()
         global_step = start_step
+        if self.accelerator.is_local_main_process:
+            print(f"[trainer] Starting from step {global_step}. Entering epoch loop.", flush=True)
 
         if exists(resumable_with_seed):
             orig_epoch_step = len(train_dataloader)
+            total_steps_this_run = int(orig_epoch_step * self.epochs / self.grad_accumulation_steps)
             skipped_epoch = int(start_step // orig_epoch_step)
             skipped_batch = start_step % orig_epoch_step
-            skipped_dataloader = self.accelerator.skip_first_batches(train_dataloader, num_batches=skipped_batch)
+            if skipped_epoch >= self.epochs or start_step >= total_steps_this_run:
+                if self.accelerator.is_local_main_process:
+                    print(
+                        f"[trainer] Resume at step {start_step} is beyond current config: "
+                        f"{orig_epoch_step} batches/epoch × {self.epochs} epochs = {total_steps_this_run} total steps. "
+                        f"No training steps left. Saving and exiting. (Use a checkpoint from this dataset or increase epochs to train more.)",
+                        flush=True,
+                    )
+                # Skip the epoch loop; go straight to final save
+            else:
+                skipped_dataloader = self.accelerator.skip_first_batches(train_dataloader, num_batches=skipped_batch)
         else:
             skipped_epoch = 0
+            skipped_dataloader = None
+            total_steps_this_run = int(len(train_dataloader) * self.epochs / self.grad_accumulation_steps)
 
         for epoch in range(skipped_epoch, self.epochs):
+            if self.accelerator.is_local_main_process:
+                print(f"[trainer] Epoch {epoch + 1}/{self.epochs} started.", flush=True)
             self.model.train()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
                 progress_bar = tqdm(
@@ -354,10 +384,12 @@ class Trainer:
 
                 progress_bar.set_postfix(step=str(global_step), loss=loss.item())
 
-                if global_step % (self.save_per_updates * self.grad_accumulation_steps) == 0:
+                save_interval = self.save_per_updates * self.grad_accumulation_steps
+                if save_interval > 0 and global_step % save_interval == 0:
                     self.save_checkpoint(global_step)
 
                     if self.log_samples and self.accelerator.is_local_main_process:
+                        print(f"[trainer] Generating log samples at step {global_step} (may take a moment)...", flush=True)
                         ref_audio_len = mel_lengths[0]
                         infer_text = [
                             text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
@@ -383,10 +415,23 @@ class Trainer:
 
                         torchaudio.save(f"{log_samples_path}/step_{global_step}_gen.wav", gen_audio, target_sample_rate)
                         torchaudio.save(f"{log_samples_path}/step_{global_step}_ref.wav", ref_audio, target_sample_rate)
+                        print(f"[trainer] Log samples saved for step {global_step}.", flush=True)
 
-                if global_step % self.last_per_steps == 0:
+                if self.last_per_steps > 0 and global_step % self.last_per_steps == 0:
                     self.save_checkpoint(global_step, last=True)
 
-        self.save_checkpoint(global_step, last=True)
+            # Save at end of every N epochs (if set)
+            if self.save_every_epochs > 0 and (epoch + 1) % self.save_every_epochs == 0:
+                if self.accelerator.is_local_main_process:
+                    print(f"[trainer] End of epoch {epoch + 1}: saving checkpoint (save every {self.save_every_epochs} epochs).", flush=True)
+                self.save_checkpoint(global_step)
+                self.save_checkpoint(global_step, last=True)
 
+        if self.accelerator.is_local_main_process:
+            print("[trainer] Training loop finished. Saving final checkpoint...", flush=True)
+        self.save_checkpoint(global_step, last=True)
+        if self.accelerator.is_local_main_process:
+            print("[trainer] Calling accelerator.end_training()...", flush=True)
         self.accelerator.end_training()
+        if self.accelerator.is_local_main_process:
+            print("[trainer] Training done.", flush=True)

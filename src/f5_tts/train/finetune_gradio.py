@@ -61,6 +61,9 @@ path_data = str(files("f5_tts").joinpath("../../data"))
 path_project_ckpts = str(files("f5_tts").joinpath("../../ckpts"))
 file_train = str(files("f5_tts").joinpath("train/finetune_cli.py"))
 
+# Default pretrain path (Docker); easy to copy or fill via "Use default path" button
+DEFAULT_PRETRAIN_CKPT = "/workspace/F5-TTS/ckpts/firstpixelptbr/model_last.pt"
+
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 
@@ -78,6 +81,7 @@ def save_settings(
     num_warmup_updates,
     save_per_updates,
     last_per_steps,
+    save_every_epochs,
     finetune,
     file_checkpoint_train,
     tokenizer_type,
@@ -102,6 +106,7 @@ def save_settings(
         "num_warmup_updates": num_warmup_updates,
         "save_per_updates": save_per_updates,
         "last_per_steps": last_per_steps,
+        "save_every_epochs": save_every_epochs,
         "finetune": finetune,
         "file_checkpoint_train": file_checkpoint_train,
         "tokenizer_type": tokenizer_type,
@@ -134,6 +139,7 @@ def load_settings(project_name):
             "num_warmup_updates": 2,
             "save_per_updates": 300,
             "last_per_steps": 100,
+            "save_every_epochs": 0,
             "finetune": True,
             "file_checkpoint_train": "",
             "tokenizer_type": "char",
@@ -154,6 +160,7 @@ def load_settings(project_name):
             settings["num_warmup_updates"],
             settings["save_per_updates"],
             settings["last_per_steps"],
+            settings.get("save_every_epochs", 0),
             settings["finetune"],
             settings["file_checkpoint_train"],
             settings["tokenizer_type"],
@@ -169,6 +176,8 @@ def load_settings(project_name):
             settings["logger"] = "wandb"
         if "bnb_optimizer" not in settings:
             settings["bnb_optimizer"] = False
+        if "save_every_epochs" not in settings:
+            settings["save_every_epochs"] = 0
     return (
         settings["exp_name"],
         settings["learning_rate"],
@@ -181,6 +190,7 @@ def load_settings(project_name):
         settings["num_warmup_updates"],
         settings["save_per_updates"],
         settings["last_per_steps"],
+        settings["save_every_epochs"],
         settings["finetune"],
         settings["file_checkpoint_train"],
         settings["tokenizer_type"],
@@ -395,6 +405,7 @@ def start_training(
     num_warmup_updates=200,
     save_per_updates=400,
     last_per_steps=800,
+    save_every_epochs=0,
     finetune=True,
     file_checkpoint_train="",
     tokenizer_type="char",
@@ -447,10 +458,12 @@ def start_training(
 
     dataset_name = dataset_name.replace("_pinyin", "").replace("_char", "")
 
-    if mixed_precision != "none":
-        fp16 = f"--mixed_precision={mixed_precision}"
-    else:
-        fp16 = ""
+    # Explicit accelerate args to avoid "had defaults used instead" warning
+    mixed_precision_flag = f"--mixed_precision={mixed_precision}" if mixed_precision != "none" else "--mixed_precision=no"
+    accelerate_opts = (
+        "--num_processes 1 --num_machines 1 "
+        f"{mixed_precision_flag} --dynamo_backend no"
+    )
 
     # CLI expects int for these args (Gradio may pass float)
     batch_size_per_gpu = int(batch_size_per_gpu)
@@ -460,9 +473,10 @@ def start_training(
     num_warmup_updates = int(num_warmup_updates)
     save_per_updates = int(save_per_updates)
     last_per_steps = int(last_per_steps)
+    save_every_epochs = int(save_every_epochs)
 
     cmd = (
-        f"accelerate launch {fp16} {file_train} --exp_name {exp_name} "
+        f"accelerate launch {accelerate_opts} {file_train} --exp_name {exp_name} "
         f"--learning_rate {learning_rate} "
         f"--batch_size_per_gpu {batch_size_per_gpu} "
         f"--batch_size_type {batch_size_type} "
@@ -473,6 +487,7 @@ def start_training(
         f"--num_warmup_updates {num_warmup_updates} "
         f"--save_per_updates {save_per_updates} "
         f"--last_per_steps {last_per_steps} "
+        f"--save_every_epochs {save_every_epochs} "
         f"--dataset_name {dataset_name}"
     )
 
@@ -507,6 +522,7 @@ def start_training(
         num_warmup_updates,
         save_per_updates,
         last_per_steps,
+        save_every_epochs,
         finetune,
         file_checkpoint_train,
         tokenizer_type,
@@ -1578,6 +1594,20 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                 file_checkpoint_train = gr.Textbox(label="Path to the Pretrained Checkpoint", value="")
 
             with gr.Row():
+                txt_default_ckpt = gr.Textbox(
+                    label="Default (Docker)",
+                    value=DEFAULT_PRETRAIN_CKPT,
+                    interactive=False,
+                    scale=8,
+                )
+                bt_use_default_ckpt = gr.Button("Use default path", scale=2)
+                bt_use_default_ckpt.click(
+                    fn=lambda: DEFAULT_PRETRAIN_CKPT,
+                    inputs=[],
+                    outputs=[file_checkpoint_train],
+                )
+
+            with gr.Row():
                 exp_name = gr.Radio(label="Model", choices=["F5TTS_Base", "E2TTS_Base"], value="F5TTS_Base")
                 learning_rate = gr.Number(label="Learning Rate", value=1e-5, step=1e-5)
 
@@ -1596,6 +1626,10 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
             with gr.Row():
                 save_per_updates = gr.Number(label="Save per Updates", value=300)
                 last_per_steps = gr.Number(label="Last per Steps", value=100)
+                save_every_epochs = gr.Number(
+                    label="Save every N epochs (0 = off, use Save per Updates)",
+                    value=0,
+                )
 
             with gr.Row():
                 ch_8bit_adam = gr.Checkbox(label="Use 8-bit Adam optimizer")
@@ -1617,6 +1651,7 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                     num_warmupv_updatesv,
                     save_per_updatesv,
                     last_per_stepsv,
+                    save_every_epochsv,
                     finetunev,
                     file_checkpoint_trainv,
                     tokenizer_typev,
@@ -1636,6 +1671,7 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                 num_warmup_updates.value = num_warmupv_updatesv
                 save_per_updates.value = save_per_updatesv
                 last_per_steps.value = last_per_stepsv
+                save_every_epochs.value = save_every_epochsv
                 ch_finetune.value = finetunev
                 file_checkpoint_train.value = file_checkpoint_trainv
                 tokenizer_type.value = tokenizer_typev
@@ -1694,6 +1730,7 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                     num_warmup_updates,
                     save_per_updates,
                     last_per_steps,
+                    save_every_epochs,
                     ch_finetune,
                     file_checkpoint_train,
                     tokenizer_type,
@@ -1748,6 +1785,7 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                     num_warmup_updates,
                     save_per_updates,
                     last_per_steps,
+                    save_every_epochs,
                     ch_finetune,
                     file_checkpoint_train,
                     tokenizer_type,

@@ -145,6 +145,7 @@ def initialize_asr_pipeline(device: str = device, dtype=None):
             else torch.float32
         )
     global asr_pipe
+    print("[ASR] Loading Whisper model (first time may take a minute)...", flush=True)
     asr_pipe = pipeline(
         "automatic-speech-recognition",
         model="openai/whisper-large-v3-turbo",
@@ -152,6 +153,7 @@ def initialize_asr_pipeline(device: str = device, dtype=None):
         device=device,
         ignore_warning=True,
     )
+    print("[ASR] Whisper ready.", flush=True)
 
 
 # transcribe

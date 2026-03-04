@@ -199,13 +199,13 @@ class DynamicBatchSampler(Sampler[list[int]]):
 
         indices, batches = [], []
         data_source = self.sampler.data_source
-
+        print("[dataset] Building dynamic batches: sorting by duration...", flush=True)
         for idx in tqdm(
             self.sampler, desc="Sorting with sampler... if slow, check whether dataset is provided with duration"
         ):
             indices.append((idx, data_source.get_frame_len(idx)))
         indices.sort(key=lambda elem: elem[1])
-
+        print(f"[dataset] Creating dynamic batches ({len(indices)} samples, {frames_threshold} frames/gpu)...", flush=True)
         batch = []
         batch_frames = 0
         for idx, frame_len in tqdm(
@@ -260,22 +260,28 @@ def load_dataset(
                     - "CustomDatasetPath" if you just want to pass the full path to a preprocessed dataset without relying on tokenizer
     """
 
-    print("Loading dataset ...")
+    print("[dataset] Loading dataset ...", flush=True)
 
     if dataset_type == "CustomDataset":
         rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{tokenizer}"))
+        print(f"[dataset] Path: {rel_data_path}, audio_type={audio_type}", flush=True)
         if audio_type == "raw":
             try:
+                print("[dataset] Loading raw from disk...", flush=True)
                 train_dataset = load_from_disk(f"{rel_data_path}/raw")
             except:  # noqa: E722
+                print("[dataset] Loading from raw.arrow...", flush=True)
                 train_dataset = Dataset_.from_file(f"{rel_data_path}/raw.arrow")
             preprocessed_mel = False
         elif audio_type == "mel":
+            print("[dataset] Loading mel.arrow...", flush=True)
             train_dataset = Dataset_.from_file(f"{rel_data_path}/mel.arrow")
             preprocessed_mel = True
+        print("[dataset] Loading duration.json...", flush=True)
         with open(f"{rel_data_path}/duration.json", "r", encoding="utf-8") as f:
             data_dict = json.load(f)
         durations = data_dict["duration"]
+        print(f"[dataset] Building CustomDataset ({len(durations)} entries)...", flush=True)
         train_dataset = CustomDataset(
             train_dataset,
             durations=durations,
@@ -283,8 +289,10 @@ def load_dataset(
             mel_spec_module=mel_spec_module,
             **mel_spec_kwargs,
         )
+        print("[dataset] Dataset ready.", flush=True)
 
     elif dataset_type == "CustomDatasetPath":
+        print(f"[dataset] CustomDatasetPath: {dataset_name}", flush=True)
         try:
             train_dataset = load_from_disk(f"{dataset_name}/raw")
         except:  # noqa: E722

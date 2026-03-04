@@ -2,6 +2,7 @@ import argparse
 import os
 import shutil
 
+import torch
 from cached_path import cached_path
 from f5_tts.model import CFM, UNetT, DiT, Trainer
 from f5_tts.model.utils import get_tokenizer
@@ -46,6 +47,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--num_warmup_updates", type=int, default=300, help="Warmup steps")
     parser.add_argument("--save_per_updates", type=int, default=10000, help="Save checkpoint every X steps")
+    parser.add_argument("--save_every_epochs", type=int, default=0, help="Save checkpoint at end of every N epochs (0 = use save_per_updates only)")
     parser.add_argument("--last_per_steps", type=int, default=50000, help="Save last checkpoint every X steps")
     parser.add_argument("--finetune", action="store_true", help="Use Finetune")
     parser.add_argument("--pretrain", type=str, default=None, help="the path to the checkpoint")
@@ -78,6 +80,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print("[finetune_cli] Starting finetune...", flush=True)
 
     checkpoint_path = str(files("f5_tts").joinpath(f"../../ckpts/{args.dataset_name}"))
 
@@ -102,13 +105,37 @@ def main():
                 ckpt_path = args.pretrain
 
     if args.finetune:
+        # Normalize pretrain path: "workspace/..." -> "/workspace/..." when path does not exist
+        if ckpt_path and not os.path.isfile(ckpt_path) and ckpt_path.startswith("workspace"):
+            ckpt_path_abs = os.path.normpath("/" + ckpt_path)
+            if os.path.isfile(ckpt_path_abs):
+                ckpt_path = ckpt_path_abs
+
         if not os.path.isdir(checkpoint_path):
             os.makedirs(checkpoint_path, exist_ok=True)
 
         file_checkpoint = os.path.join(checkpoint_path, os.path.basename(ckpt_path))
         if not os.path.isfile(file_checkpoint):
-            shutil.copy2(ckpt_path, file_checkpoint)
-            print("copy checkpoint for finetune")
+            if not os.path.isfile(ckpt_path):
+                raise FileNotFoundError(
+                    f"Pretrain checkpoint not found: {ckpt_path}. Use absolute path (e.g. /workspace/F5-TTS/ckpts/...)."
+                )
+            print(f"[finetune_cli] Copying pretrain checkpoint (may take a minute)...", flush=True)
+            # When starting a NEW project from pretrain, save with step=0 so the trainer runs all epochs
+            # (otherwise the pretrain file may contain step=199800 from another run and "no steps left")
+            try:
+                ckpt = torch.load(ckpt_path, weights_only=True, map_location="cpu")
+                if isinstance(ckpt, dict) and "step" in ckpt:
+                    ckpt["step"] = 0
+                    torch.save(ckpt, file_checkpoint)
+                    print("[finetune_cli] Pretrain copied with step reset to 0 (new run will do all epochs).", flush=True)
+                else:
+                    shutil.copy2(ckpt_path, file_checkpoint)
+                    print("[finetune_cli] Copy checkpoint for finetune done.", flush=True)
+                del ckpt
+            except Exception:
+                shutil.copy2(ckpt_path, file_checkpoint)
+                print("[finetune_cli] Copy checkpoint for finetune done.", flush=True)
 
     # Use the tokenizer and tokenizer_path provided in the command line arguments
     tokenizer = args.tokenizer
@@ -119,10 +146,9 @@ def main():
     else:
         tokenizer_path = args.dataset_name
 
+    print("[finetune_cli] Loading tokenizer...", flush=True)
     vocab_char_map, vocab_size = get_tokenizer(tokenizer_path, tokenizer)
-
-    print("\nvocab : ", vocab_size)
-    print("\nvocoder : ", mel_spec_type)
+    print(f"[finetune_cli] Vocab size: {vocab_size}, vocoder: {mel_spec_type}", flush=True)
 
     mel_spec_kwargs = dict(
         n_fft=n_fft,
@@ -133,11 +159,13 @@ def main():
         mel_spec_type=mel_spec_type,
     )
 
+    print("[finetune_cli] Building model...", flush=True)
     model = CFM(
         transformer=model_cls(**model_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
         mel_spec_kwargs=mel_spec_kwargs,
         vocab_char_map=vocab_char_map,
     )
+    print("[finetune_cli] Model built. Creating Trainer...", flush=True)
 
     trainer = Trainer(
         model,
@@ -157,10 +185,13 @@ def main():
         wandb_resume_id=wandb_resume_id,
         log_samples=args.log_samples,
         last_per_steps=args.last_per_steps,
+        save_every_epochs=args.save_every_epochs,
         bnb_optimizer=args.bnb_optimizer,
     )
 
+    print("[finetune_cli] Loading dataset (this may take a while)...", flush=True)
     train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)
+    print(f"[finetune_cli] Dataset loaded, {len(train_dataset)} samples. Starting training loop...", flush=True)
 
     trainer.train(
         train_dataset,
