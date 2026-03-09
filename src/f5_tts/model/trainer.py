@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+import time
 
 import torch
 import torchaudio
@@ -238,6 +239,7 @@ class Trainer:
         """Generate and save ref/gen audio samples (only when log_samples=True and on main process)."""
         if not self.log_samples or not self.accelerator.is_local_main_process:
             return
+        t0 = time.perf_counter()
         cfg_strength, nfe_step, sway_sampling_coef = self._log_samples_cfg
         vocoder = self._log_samples_vocoder
         log_samples_path = self._log_samples_path
@@ -248,7 +250,10 @@ class Trainer:
         infer_text = [
             text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
         ]
+        print(f"[trainer] Log samples step {global_step}: preparing inputs (ref_frames={ref_audio_len.item()})...", flush=True)
+        t1 = time.perf_counter()
         with torch.inference_mode():
+            print(f"[trainer] Log samples step {global_step}: running diffusion sampling ({nfe_step} steps)...", flush=True)
             generated, _ = self.accelerator.unwrap_model(self.model).sample(
                 cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
                 text=infer_text,
@@ -257,6 +262,8 @@ class Trainer:
                 cfg_strength=cfg_strength,
                 sway_sampling_coef=sway_sampling_coef,
             )
+            t2 = time.perf_counter()
+            print(f"[trainer] Log samples step {global_step}: diffusion done ({t2-t1:.1f}s), decoding with vocoder...", flush=True)
             generated = generated.to(torch.float32)
             gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
             ref_mel_spec = batch["mel"][0].unsqueeze(0)
@@ -266,9 +273,12 @@ class Trainer:
             elif self.vocoder_name == "bigvgan":
                 gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
                 ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
+            t3 = time.perf_counter()
+            print(f"[trainer] Log samples step {global_step}: vocoder done ({t3-t2:.1f}s), saving wav files...", flush=True)
         torchaudio.save(f"{log_samples_path}/step_{global_step}_gen.wav", gen_audio, target_sample_rate)
         torchaudio.save(f"{log_samples_path}/step_{global_step}_ref.wav", ref_audio, target_sample_rate)
-        print(f"[trainer] Log samples saved for step {global_step}.", flush=True)
+        t4 = time.perf_counter()
+        print(f"[trainer] Log samples saved for step {global_step}. Total: {t4-t0:.1f}s (diffusion: {t2-t1:.1f}s, vocoder: {t3-t2:.1f}s, save: {t4-t3:.1f}s)", flush=True)
 
     def _plot_loss_curve(self):
         """Plot training loss vs step and save to checkpoint_path/graphics/loss.png."""

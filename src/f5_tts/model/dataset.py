@@ -263,7 +263,9 @@ def load_dataset(
     print("[dataset] Loading dataset ...", flush=True)
 
     if dataset_type == "CustomDataset":
-        rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{tokenizer}"))
+        # When tokenizer is "custom", data lives in _char (custom vocab used with char projects)
+        data_suffix = "char" if tokenizer == "custom" else tokenizer
+        rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{data_suffix}"))
         print(f"[dataset] Path: {rel_data_path}, audio_type={audio_type}", flush=True)
         if audio_type == "raw":
             try:
