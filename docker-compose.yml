@@ -1,0 +1,20 @@
+# F5-TTS - Inferência (Gradio na porta 7860)
+# Uso: docker-compose up --build
+# Acesso: http://localhost:7860
+services:
+  f5-tts:
+    build: .
+    image: f5-tts:latest
+    ports:
+      - "7860:7860"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Persistir dados/checkpoints no host (opcional)
+    # volumes:
+    #   - ./data:/workspace/F5-TTS/data
+    #   - ./ckpts:/workspace/F5-TTS/ckpts

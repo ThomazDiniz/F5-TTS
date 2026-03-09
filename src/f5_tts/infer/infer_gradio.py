@@ -2,10 +2,27 @@
 # Above allows ruff to ignore E402: module level import not at top of file
 
 import json
+import os
 import re
+import sys
 import tempfile
 from collections import OrderedDict
+from glob import glob
 from importlib.resources import files
+
+# Suppress Gradio "please upgrade" message (we pin 3.x on purpose)
+class _StderrFilter:
+    def __init__(self, stderr):
+        self._stderr = stderr
+    def write(self, msg):
+        if "IMPORTANT" in msg and "please upgrade" in msg:
+            return
+        self._stderr.write(msg)
+    def flush(self):
+        self._stderr.flush()
+    def __getattr__(self, name):
+        return getattr(self._stderr, name)
+sys.stderr = _StderrFilter(sys.stderr)
 
 import click
 import gradio as gr
@@ -49,6 +66,27 @@ DEFAULT_TTS_MODEL_CFG = [
     "hf://SWivid/F5-TTS/F5TTS_Base/vocab.txt",
     json.dumps(dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)),
 ]
+
+# ckpts workspace (local ou /workspace/F5-TTS/ckpts no Docker) para aparecer no dropdown
+_path_ckpts = str(files("f5_tts").joinpath("../../ckpts"))
+
+
+def _workspace_ckpt_choices():
+    out = []
+    if os.path.isdir(_path_ckpts):
+        for p in glob(os.path.join(_path_ckpts, "*", "*.pt")) + glob(
+            os.path.join(_path_ckpts, "*", "*.safetensors")
+        ):
+            out.append(p)
+    return sorted(out)
+
+
+def _workspace_vocab_choices():
+    out = []
+    if os.path.isdir(_path_ckpts):
+        for p in glob(os.path.join(_path_ckpts, "*", "vocab.txt")):
+            out.append(p)
+    return sorted(out)
 
 
 # load models
@@ -186,7 +224,10 @@ with gr.Blocks() as app_credits:
 """)
 with gr.Blocks() as app_tts:
     gr.Markdown("# Batched TTS")
-    ref_audio_input = gr.Audio(label="Reference Audio")
+    ref_audio_input = gr.Audio(
+        label="Reference Audio",
+        type="filepath",
+    )
     gen_text_input = gr.Textbox(label="Text to Generate", lines=10)
     generate_btn = gr.Button("Synthesize", variant="primary")
     with gr.Accordion("Advanced Settings", open=False):
@@ -332,7 +373,10 @@ with gr.Blocks() as app_multistyle:
         with gr.Column():
             regular_name = gr.Textbox(value="Regular", label="Speech Type Name")
             regular_insert = gr.Button("Insert Label", variant="secondary")
-        regular_audio = gr.Audio(label="Regular Reference Audio")
+        regular_audio = gr.Audio(
+            label="Regular Reference Audio",
+            type="filepath",
+        )
         regular_ref_text = gr.Textbox(label="Reference Text (Regular)", lines=2)
 
     # Regular speech type (max 100)
@@ -351,7 +395,10 @@ with gr.Blocks() as app_multistyle:
                 name_input = gr.Textbox(label="Speech Type Name")
                 delete_btn = gr.Button("Delete Type", variant="secondary")
                 insert_btn = gr.Button("Insert Label", variant="secondary")
-            audio_input = gr.Audio(label="Reference Audio")
+            audio_input = gr.Audio(
+                label="Reference Audio",
+                type="filepath",
+            )
             ref_text_input = gr.Textbox(label="Reference Text", lines=2)
         speech_type_rows.append(row)
         speech_type_names.append(name_input)
@@ -581,7 +628,10 @@ Have a conversation with an AI using your reference voice!
     with chat_interface_container:
         with gr.Row():
             with gr.Column():
-                ref_audio_chat = gr.Audio(label="Reference Audio")
+                ref_audio_chat = gr.Audio(
+                    label="Reference Audio",
+                    type="filepath",
+                )
             with gr.Column():
                 with gr.Accordion("Advanced Settings", open=False):
                     remove_silence_chat = gr.Checkbox(
@@ -605,6 +655,7 @@ Have a conversation with an AI using your reference voice!
             with gr.Column():
                 audio_input_chat = gr.Microphone(
                     label="Speak your message",
+                    type="filepath",
                 )
                 audio_output_chat = gr.Audio(autoplay=True)
             with gr.Column():
@@ -804,14 +855,14 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
                 choices=[DEFAULT_TTS_MODEL, "E2-TTS"], label="Choose TTS Model", value=DEFAULT_TTS_MODEL
             )
         custom_ckpt_path = gr.Dropdown(
-            choices=[DEFAULT_TTS_MODEL_CFG[0]],
+            choices=[DEFAULT_TTS_MODEL_CFG[0]] + _workspace_ckpt_choices(),
             value=load_last_used_custom()[0],
             allow_custom_value=True,
             label="Model: local_path | hf://user_id/repo_id/model_ckpt",
             visible=False,
         )
         custom_vocab_path = gr.Dropdown(
-            choices=[DEFAULT_TTS_MODEL_CFG[1]],
+            choices=[DEFAULT_TTS_MODEL_CFG[1]] + _workspace_vocab_choices(),
             value=load_last_used_custom()[1],
             allow_custom_value=True,
             label="Vocab: local_path | hf://user_id/repo_id/vocab_file",
@@ -877,7 +928,7 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
 def main(port, host, share, api, root_path):
     global app
     print("Starting app...")
-    app.queue(api_open=api).launch(server_name=host, server_port=port, share=share, root_path=root_path)
+    app.queue(api_open=api).launch(server_name=host, server_port=port, share=share, show_api=api, root_path=root_path)
 
 
 if __name__ == "__main__":

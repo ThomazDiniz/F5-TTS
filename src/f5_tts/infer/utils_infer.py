@@ -11,8 +11,6 @@ import re
 import tempfile
 from importlib.resources import files
 
-import librosa
-import soundfile as sf
 import matplotlib
 
 matplotlib.use("Agg")
@@ -147,6 +145,7 @@ def initialize_asr_pipeline(device: str = device, dtype=None):
             else torch.float32
         )
     global asr_pipe
+    print("[ASR] Loading Whisper model (first time may take a minute)...", flush=True)
     asr_pipe = pipeline(
         "automatic-speech-recognition",
         model="openai/whisper-large-v3-turbo",
@@ -154,30 +153,18 @@ def initialize_asr_pipeline(device: str = device, dtype=None):
         device=device,
         ignore_warning=True,
     )
+    print("[ASR] Whisper ready.", flush=True)
 
 
 # transcribe
-# Whisper expects 16 kHz. We load audio ourselves and pass array to avoid torchcodec
-# (torchcodec requires PyTorch 2.5+ register_fake and breaks on older installs).
-WHISPER_SAMPLE_RATE = 16000
 
 
 def transcribe(ref_audio, language=None):
     global asr_pipe
     if asr_pipe is None:
         initialize_asr_pipeline(device=device)
-    # Load with soundfile + resample to 16k so pipeline never uses torchcodec (file path)
-    if isinstance(ref_audio, str) and os.path.isfile(ref_audio):
-        audio, sr = sf.read(ref_audio, dtype="float32")
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-        if sr != WHISPER_SAMPLE_RATE:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=WHISPER_SAMPLE_RATE)
-        inputs = {"array": audio, "sampling_rate": WHISPER_SAMPLE_RATE}
-    else:
-        inputs = ref_audio
     return asr_pipe(
-        inputs,
+        ref_audio,
         chunk_length_s=30,
         batch_size=128,
         generate_kwargs={"task": "transcribe", "language": language} if language else {"task": "transcribe"},
@@ -298,31 +285,6 @@ def remove_silence_edges(audio, silence_threshold=-42):
 
 def preprocess_ref_audio_text(ref_audio_orig, ref_text, clip_short=True, show_info=print, device=device):
     show_info("Converting audio...")
-    
-    # Handle Gradio 3.x audio input - it returns a tuple (sample_rate, audio_data) instead of filepath
-    if isinstance(ref_audio_orig, tuple):
-        sample_rate, audio_data = ref_audio_orig
-        # Convert numpy array to temporary file
-        if isinstance(audio_data, np.ndarray):
-            # Ensure audio_data is 1D and float32
-            if len(audio_data.shape) > 1:
-                audio_data = audio_data.flatten()
-            # Normalize to [-1, 1] range if needed
-            if audio_data.dtype != np.float32:
-                if audio_data.max() > 1.0 or audio_data.min() < -1.0:
-                    # Assume int16 range
-                    audio_data = audio_data.astype(np.float32) / 32767.0
-                else:
-                    audio_data = audio_data.astype(np.float32)
-            # Create temporary file with audio data
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-                # Convert to tensor and add channel dimension if needed
-                audio_tensor = torch.from_numpy(audio_data)
-                if len(audio_tensor.shape) == 1:
-                    audio_tensor = audio_tensor.unsqueeze(0)
-                torchaudio.save(temp_audio.name, audio_tensor, sample_rate)
-                ref_audio_orig = temp_audio.name
-    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
         aseg = AudioSegment.from_file(ref_audio_orig)
 
@@ -366,7 +328,6 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, clip_short=True, show_in
         audio_data = audio_file.read()
         audio_hash = hashlib.md5(audio_data).hexdigest()
 
-    ref_text = ref_text or ""
     if not ref_text.strip():
         global _ref_audio_cache
         if audio_hash in _ref_audio_cache:

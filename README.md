@@ -21,48 +21,91 @@
 
 ## Installation
 
+### Opção 1: Conda (local)
+
+Requisitos: [Miniconda](https://docs.conda.io/en/latest/miniconda.html) ou Anaconda.
+
 ```bash
-# Option A: create env from environment.yml (recommended)
+# Criar ambiente (Python 3.10)
 conda env create -f environment.yml
 conda activate f5-tts
 
-# Option B: create env manually
-conda create -n f5-tts python=3.10
-conda activate f5-tts
+# PyTorch com CUDA 11.8 (NVIDIA). Para outra versão: cu121, ou sem GPU use torch==2.4.0 torchaudio==2.4.0
+pip install torch==2.4.0+cu118 torchaudio==2.4.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
 
-# NVIDIA GPU: install pytorch with your CUDA version, e.g.
-pip install torch==2.3.0+cu118 torchaudio==2.3.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
-
-# AMD GPU: install pytorch with your ROCm version, e.g.
-pip install torch==2.5.1+rocm6.2 torchaudio==2.5.1+rocm6.2 --extra-index-url https://download.pytorch.org/whl/rocm6.2
-```
-
-Then you can choose from a few options below:
-
-### 1. As a pip package (if just for inference)
-
-```bash
-pip install git+https://github.com/SWivid/F5-TTS.git
-```
-
-### 2. Local editable (if also do training, finetuning)
-
-```bash
-git clone https://github.com/SWivid/F5-TTS.git
-cd F5-TTS
-# git submodule update --init --recursive  # (optional, if need bigvgan)
+# Instalar o projeto
 pip install -e .
 ```
 
-### 3. Docker usage
-```bash
-# Build from Dockerfile
-docker build -t f5tts:v1 .
+### Opção 2: Docker
 
-# Or pull from GitHub Container Registry
-docker pull ghcr.io/swivid/f5-tts:main
+Requisitos: Docker com [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (para GPU).
+
+```bash
+# Build da imagem (na pasta do projeto)
+docker build -t firstpixel-f5tts:local .
 ```
 
+Não é necessário rodar scripts `.bat`; use os comandos abaixo para rodar.
+
+## How to run
+
+### Com Conda (após instalação local)
+
+```bash
+conda activate f5-tts
+```
+
+**Inferência (TTS)** — interface em http://localhost:7860:
+
+```bash
+f5-tts_infer-gradio --host 0.0.0.0 --port 7860
+```
+
+**Finetune** — interface em http://localhost:7860:
+
+```bash
+f5-tts_finetune-gradio --host 0.0.0.0 --port 7860
+```
+
+### Com Docker
+
+**Inferência** — cache Hugging Face e checkpoints no host; interface em http://localhost:7860:
+
+```bash
+docker run --rm -it --gpus all -p 7860:7860 \
+  -v f5tts_hf_cache:/root/.cache/huggingface \
+  -v "$(pwd)/ckpts:/workspace/F5-TTS/ckpts" \
+  firstpixel-f5tts:local \
+  f5-tts_infer-gradio --host 0.0.0.0 --port 7860
+```
+
+No Windows (CMD), use `%cd%` em vez de `$(pwd)`:
+
+```cmd
+docker run --rm -it --gpus all -p 7860:7860 -v f5tts_hf_cache:/root/.cache/huggingface -v "%cd%\ckpts:/workspace/F5-TTS/ckpts" firstpixel-f5tts:local f5-tts_infer-gradio --host 0.0.0.0 --port 7860
+```
+
+**Finetune** — porta 7861 para não conflitar; montar `ckpts` e `data`:
+
+```bash
+docker run --rm -it --gpus all -p 7861:7860 \
+  -v f5tts_hf_cache:/root/.cache/huggingface \
+  -v "$(pwd)/ckpts:/workspace/F5-TTS/ckpts" \
+  -v "$(pwd)/data:/workspace/F5-TTS/data" \
+  firstpixel-f5tts:local \
+  f5-tts_finetune-gradio --host 0.0.0.0 --port 7860
+```
+
+Interface em http://localhost:7861.
+
+**Shell dentro do container:**
+
+```bash
+docker run --rm -it firstpixel-f5tts:local bash
+```
+
+Detalhes e caminhos de checkpoints (ex.: `firstpixelptbr`): ver [DOCKER.md](DOCKER.md).
 
 ## Inference
 
@@ -109,6 +152,7 @@ f5-tts_infer-cli -c src/f5_tts/infer/examples/multi/story.toml
 ### 3. More instructions
 
 - In order to have better generation results, take a moment to read [detailed guidance](src/f5_tts/infer).
+- For automatic transcription (ASR), use language **portuguese** (not "portugues").
 - The [Issues](https://github.com/SWivid/F5-TTS/issues?q=is%3Aissue) are very useful, please try to find the solution by properly searching the keywords of problem encountered. If no answer found, then feel free to open an issue.
 
 
@@ -116,7 +160,7 @@ f5-tts_infer-cli -c src/f5_tts/infer/examples/multi/story.toml
 
 ### 1. Gradio App
 
-Read [training & finetuning guidance](src/f5_tts/train) for more instructions.
+Read [training & finetuning guidance](src/f5_tts/train) for more instructions. For transcribing audio in the finetune UI, use language **portuguese** (not "portugues").
 
 ```bash
 # Quick start with Gradio web interface
