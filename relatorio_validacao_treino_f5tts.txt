@@ -1,0 +1,126 @@
+================================================================================
+  RELATÓRIO: COMO FUNCIONA O ALGORITMO DE VALIDAÇÃO DO F5-TTS PARA TREINO
+================================================================================
+Projeto: F5-TTS-FirstPixelToTRAIN
+Data: Março 2025
+
+--------------------------------------------------------------------------------
+1. RESUMO
+--------------------------------------------------------------------------------
+O F5-TTS não possui um loop de validação clássico (conjunto de validação separado,
+loss de validação ou early stopping). O que existe é:
+
+  (1) Monitoramento da loss de treino a cada step.
+  (2) Geração de "log samples" (áudios ref + gerados) em cada salvamento de
+      checkpoint, para inspeção qualitativa pelo usuário.
+  (3) Avaliação objetiva (WER, similaridade, etc.) feita fora do treino, por
+      scripts em src/f5_tts/eval/.
+
+--------------------------------------------------------------------------------
+2. O QUE ACONTECE DURANTE O TREINO
+--------------------------------------------------------------------------------
+2.1 Loss de treino (única métrica automática no loop)
+
+  - A cada batch, o modelo CFM faz forward: recebe mel, texto e comprimentos.
+  - É calculada a loss de flow matching (predição do campo vetorial).
+  - Essa loss é usada para backward, optimizer.step() e scheduler.step().
+  - O valor é registrado no logger (WandB ou TensorBoard) a cada step, quando
+    is_local_main_process e sync_gradients.
+
+  Arquivo: src/f5_tts/model/trainer.py (loop principal)
+  Trecho relevante: loss, cond, pred = self.model(mel_spec, text=..., lens=...);
+  self.accelerator.log({"loss": loss.item(), "lr": ...}, step=global_step).
+
+  Não há cálculo de loss em um conjunto de validação; só há loss de treino.
+
+--------------------------------------------------------------------------------
+2.2 Log samples (validação qualitativa)
+
+  Quando --log_samples está ativo (padrão na UI de finetune e no CLI):
+
+  - Nos steps em que um checkpoint é salvo (por save_per_updates ou por
+    last_per_steps), o trainer gera amostras de áudio antes de seguir.
+  - Processo:
+    1. Usa o primeiro exemplo do batch atual: áudio de referência (ref) e
+       texto.
+    2. Monta o texto de inferência como: texto do exemplo + " " + mesmo texto
+       (duplicado).
+    3. Chama model.sample() em modo inferência (torch.inference_mode()):
+       - Condição: mel do ref até ref_audio_len.
+       - Duração da geração: ref_audio_len * 2.
+       - Usa os mesmos parâmetros de inferência do projeto (nfe_step,
+         cfg_strength, sway_sampling_coef).
+    4. Decodifica o mel gerado com o vocoder (Vocos ou BigVGAN) para waveform.
+    5. Salva dois arquivos em ckpts/<projeto>/samples/:
+       - step_<global_step>_ref.wav  (áudio de referência)
+       - step_<global_step>_gen.wav  (áudio gerado pelo modelo)
+
+  Assim, a "validação" durante o treino é apenas qualitativa: o usuário ouve
+  os arquivos em samples/ para decidir se a qualidade está aceitável ou se
+  deve parar/ajustar hiperparâmetros. Não há métrica numérica automática
+  (WER, MOS, similaridade) calculada nesse momento.
+
+  Arquivo: src/f5_tts/model/trainer.py
+  Método: _generate_and_save_log_samples(global_step, batch)
+  Chamado quando: global_step % save_interval == 0 ou
+                  global_step % last_per_steps == 0 (e log_samples=True).
+
+--------------------------------------------------------------------------------
+2.3 EMA (Exponential Moving Average)
+
+  - O trainer mantém uma cópia do modelo em EMA (ema_model).
+  - A cada step (após sync_gradients), em processo principal: ema_model.update().
+  - Os checkpoints salvos contêm ema_model_state_dict; na inferência costuma-se
+    usar os pesos EMA, que tendem a ser mais estáveis.
+
+  Isso não é "validação", mas afeta qual modelo é salvo e usado depois.
+
+--------------------------------------------------------------------------------
+3. O QUE NÃO EXISTE NO TREINO
+--------------------------------------------------------------------------------
+  - Não há split train/val no dataset.
+  - Não há cálculo de loss em conjunto de validação.
+  - Não há early stopping baseado em métrica de validação.
+  - Não há cálculo automático de WER, similaridade de speaker ou MOS durante
+    o treino.
+
+--------------------------------------------------------------------------------
+4. AVALIAÇÃO OBJETIVA (FORA DO TREINO)
+--------------------------------------------------------------------------------
+  Os scripts em src/f5_tts/eval/ servem para avaliar áudios já gerados (por
+  exemplo, por batch inference em um conjunto de teste):
+
+  - eval_seedtts_testset.py: WER (ZH) e similaridade (SIM).
+  - eval_librispeech_test_clean.py: WER e SIM em LibriSpeech test-clean.
+  - eval_utmos.py: UTMOS (qualidade MOS).
+  - eval_infer_batch.py / eval_infer_batch.sh: geração em batch para esses testes.
+
+  Esses passos são executados pelo usuário depois de gerar os .wav; não são
+  chamados pelo loop de treino.
+
+  Referência: src/f5_tts/eval/README.md.
+
+--------------------------------------------------------------------------------
+5. FLUXO RESUMIDO DO “ALGORITMO DE VALIDAÇÃO” NO TREINO
+--------------------------------------------------------------------------------
+  (1) A cada step: treino com um batch; log da loss (e lr) no logger.
+  (2) A cada save_interval ou last_per_steps: salvar checkpoint; se
+      log_samples=True, gerar e salvar ref.wav e gen.wav para o primeiro
+      exemplo do batch em ckpts/<projeto>/samples/.
+  (3) O usuário acompanha pela curva de loss e, principalmente, ouvindo os
+      samples em samples/ para decidir se o treino está bom ou não.
+  (4) Avaliação objetiva (WER, SIM, UTMOS) é feita à parte, após gerar áudios
+      com os scripts de eval.
+
+--------------------------------------------------------------------------------
+6. CONCLUSÃO
+--------------------------------------------------------------------------------
+O F5-TTS não implementa validação no sentido de “métrica em conjunto de validação
+dentro do loop de treino”. A única forma de “validar” durante o treino é a
+inspeção qualitativa dos log samples (ref + gen) gravados em cada checkpoint.
+Para métricas objetivas, é necessário rodar os scripts de avaliação em
+src/f5_tts/eval/ sobre áudios gerados em batch.
+
+================================================================================
+  Fim do relatório
+================================================================================

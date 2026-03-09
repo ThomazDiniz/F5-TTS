@@ -63,7 +63,13 @@ def parse_args():
     parser.add_argument(
         "--log_samples",
         action="store_true",
-        help="Log inferenced samples per ckpt save steps",
+        default=True,
+        help="Log inferenced samples per ckpt save steps (default: True)",
+    )
+    parser.add_argument(
+        "--no_log_samples",
+        action="store_true",
+        help="Disable log samples (override --log_samples)",
     )
     parser.add_argument("--logger", type=str, default=None, choices=["wandb", "tensorboard"], help="logger")
     parser.add_argument(
@@ -183,7 +189,7 @@ def main():
         wandb_project=args.dataset_name,
         wandb_run_name=args.exp_name,
         wandb_resume_id=wandb_resume_id,
-        log_samples=args.log_samples,
+        log_samples=args.log_samples and not args.no_log_samples,
         last_per_steps=args.last_per_steps,
         save_every_epochs=args.save_every_epochs,
         bnb_optimizer=args.bnb_optimizer,

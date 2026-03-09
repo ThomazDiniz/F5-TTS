@@ -107,6 +107,8 @@ docker run --rm -it firstpixel-f5tts:local bash
 
 Detalhes e caminhos de checkpoints (ex.: `firstpixelptbr`): ver [DOCKER.md](DOCKER.md).
 
+Para treinar usando o checkpoint base **firstpixelptbr** (PT-BR) sem mismatch de vocab: [FIRSTPIXELPTBR.md](FIRSTPIXELPTBR.md). Relatório do que configurar: [relatorio_firstpixelptbr_treino.md](relatorio_firstpixelptbr_treino.md).
+
 ## Inference
 
 ### 1. Gradio App

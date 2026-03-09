@@ -51,6 +51,8 @@ Discussion board for Finetuning [#57](https://github.com/SWivid/F5-TTS/discussio
 
 Gradio UI training/finetuning with `src/f5_tts/train/finetune_gradio.py` see [#143](https://github.com/SWivid/F5-TTS/discussions/143).
 
+**Log samples:** When `--log_samples` is used (default in the Gradio UI), audio samples (ref + generated) are saved under `ckpts/<project>/samples/` every time a checkpoint is saved—both on `save_per_updates` and on `last_per_steps`. If you only use a large `save_per_updates` and stop training before reaching it, you will get checkpoints from `last_per_steps` and now samples are generated for those saves too.
+
 The `use_ema = True` is harmful for early-stage finetuned checkpoints (which goes just few updates, thus ema weights still dominated by pretrained ones), try turn it off and see if provide better results.
 
 ### 3. Wandb Logging

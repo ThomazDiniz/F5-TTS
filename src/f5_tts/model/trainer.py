@@ -234,18 +234,83 @@ class Trainer:
         gc.collect()
         return step
 
+    def _generate_and_save_log_samples(self, global_step: int, batch: dict):
+        """Generate and save ref/gen audio samples (only when log_samples=True and on main process)."""
+        if not self.log_samples or not self.accelerator.is_local_main_process:
+            return
+        cfg_strength, nfe_step, sway_sampling_coef = self._log_samples_cfg
+        vocoder = self._log_samples_vocoder
+        log_samples_path = self._log_samples_path
+        target_sample_rate = self._log_samples_target_sr
+        ref_audio_len = batch["mel_lengths"][0]
+        mel_spec = batch["mel"].permute(0, 2, 1)
+        text_inputs = batch["text"]
+        infer_text = [
+            text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
+        ]
+        with torch.inference_mode():
+            generated, _ = self.accelerator.unwrap_model(self.model).sample(
+                cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
+                text=infer_text,
+                duration=ref_audio_len * 2,
+                steps=nfe_step,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=sway_sampling_coef,
+            )
+            generated = generated.to(torch.float32)
+            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
+            ref_mel_spec = batch["mel"][0].unsqueeze(0)
+            if self.vocoder_name == "vocos":
+                gen_audio = vocoder.decode(gen_mel_spec).cpu()
+                ref_audio = vocoder.decode(ref_mel_spec).cpu()
+            elif self.vocoder_name == "bigvgan":
+                gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
+                ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
+        torchaudio.save(f"{log_samples_path}/step_{global_step}_gen.wav", gen_audio, target_sample_rate)
+        torchaudio.save(f"{log_samples_path}/step_{global_step}_ref.wav", ref_audio, target_sample_rate)
+        print(f"[trainer] Log samples saved for step {global_step}.", flush=True)
+
+    def _plot_loss_curve(self):
+        """Plot training loss vs step and save to checkpoint_path/graphics/loss.png."""
+        if not self._loss_history:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("[trainer] matplotlib not available, skipping loss plot.", flush=True)
+            return
+        steps = [h[0] for h in self._loss_history]
+        losses = [h[1] for h in self._loss_history]
+        graphics_dir = os.path.join(self.checkpoint_path, "graphics")
+        os.makedirs(graphics_dir, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(steps, losses, linewidth=0.8, color="#1f77b4")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Loss")
+        ax.set_title("Training loss over time")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        out_path = os.path.join(graphics_dir, "loss.png")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[trainer] Loss curve saved to {out_path}", flush=True)
+
     def train(self, train_dataset: Dataset, num_workers=12, resumable_with_seed: int = None):
         if self.accelerator.is_local_main_process:
             print("[trainer] train() started: preparing dataloader and scheduler...", flush=True)
+        self._loss_history = []
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
-            vocoder = load_vocoder(
+            self._log_samples_vocoder = load_vocoder(
                 vocoder_name=self.vocoder_name, is_local=self.is_local_vocoder, local_path=self.local_vocoder_path
             )
-            target_sample_rate = self.accelerator.unwrap_model(self.model).mel_spec.target_sample_rate
-            log_samples_path = f"{self.checkpoint_path}/samples"
-            os.makedirs(log_samples_path, exist_ok=True)
+            self._log_samples_target_sr = self.accelerator.unwrap_model(self.model).mel_spec.target_sample_rate
+            self._log_samples_path = f"{self.checkpoint_path}/samples"
+            self._log_samples_cfg = (cfg_strength, nfe_step, sway_sampling_coef)
+            os.makedirs(self._log_samples_path, exist_ok=True)
 
         if exists(resumable_with_seed):
             generator = torch.Generator()
@@ -377,6 +442,7 @@ class Trainer:
                 global_step += 1
 
                 if self.accelerator.is_local_main_process:
+                    self._loss_history.append((global_step, float(loss.item())))
                     self.accelerator.log({"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_step)
                     if self.logger == "tensorboard":
                         self.writer.add_scalar("loss", loss.item(), global_step)
@@ -387,38 +453,15 @@ class Trainer:
                 save_interval = self.save_per_updates * self.grad_accumulation_steps
                 if save_interval > 0 and global_step % save_interval == 0:
                     self.save_checkpoint(global_step)
-
                     if self.log_samples and self.accelerator.is_local_main_process:
                         print(f"[trainer] Generating log samples at step {global_step} (may take a moment)...", flush=True)
-                        ref_audio_len = mel_lengths[0]
-                        infer_text = [
-                            text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
-                        ]
-                        with torch.inference_mode():
-                            generated, _ = self.accelerator.unwrap_model(self.model).sample(
-                                cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
-                                text=infer_text,
-                                duration=ref_audio_len * 2,
-                                steps=nfe_step,
-                                cfg_strength=cfg_strength,
-                                sway_sampling_coef=sway_sampling_coef,
-                            )
-                            generated = generated.to(torch.float32)
-                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
-                            ref_mel_spec = batch["mel"][0].unsqueeze(0)
-                            if self.vocoder_name == "vocos":
-                                gen_audio = vocoder.decode(gen_mel_spec).cpu()
-                                ref_audio = vocoder.decode(ref_mel_spec).cpu()
-                            elif self.vocoder_name == "bigvgan":
-                                gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
-                                ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
-
-                        torchaudio.save(f"{log_samples_path}/step_{global_step}_gen.wav", gen_audio, target_sample_rate)
-                        torchaudio.save(f"{log_samples_path}/step_{global_step}_ref.wav", ref_audio, target_sample_rate)
-                        print(f"[trainer] Log samples saved for step {global_step}.", flush=True)
+                    self._generate_and_save_log_samples(global_step, batch)
 
                 if self.last_per_steps > 0 and global_step % self.last_per_steps == 0:
                     self.save_checkpoint(global_step, last=True)
+                    if self.log_samples and self.accelerator.is_local_main_process:
+                        print(f"[trainer] Generating log samples at step {global_step} (may take a moment)...", flush=True)
+                    self._generate_and_save_log_samples(global_step, batch)
 
             # Save at end of every N epochs (if set)
             if self.save_every_epochs > 0 and (epoch + 1) % self.save_every_epochs == 0:
@@ -434,4 +477,6 @@ class Trainer:
             print("[trainer] Calling accelerator.end_training()...", flush=True)
         self.accelerator.end_training()
         if self.accelerator.is_local_main_process:
+            if self._loss_history:
+                self._plot_loss_curve()
             print("[trainer] Training done.", flush=True)
