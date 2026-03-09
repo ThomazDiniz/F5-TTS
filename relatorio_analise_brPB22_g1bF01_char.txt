@@ -1,0 +1,118 @@
+================================================================================
+  RELATÓRIO DE ANÁLISE — PROJETO brPB22_g1bF01_char (arquivos de treino)
+================================================================================
+Data: Março 2025
+Projeto: F5-TTS-FirstPixelToTRAIN
+
+--------------------------------------------------------------------------------
+1. LOCALIZAÇÃO E ESTRUTURA
+--------------------------------------------------------------------------------
+  Pasta do projeto:  data/brPB22_g1bF01_char/
+
+  Arquivos e pastas encontrados:
+    - metadata.csv     (23 KB)
+    - wavs/            (291 arquivos de áudio)
+    - duration.json    (gerado pelo Prepare)
+    - raw.arrow        (gerado pelo Prepare)
+    - vocab.txt        (gerado pelo Prepare)
+    - dataset/         (pasta auxiliar)
+
+--------------------------------------------------------------------------------
+2. METADATA.CSV
+--------------------------------------------------------------------------------
+  Formato:  nome_audio|texto  (uma linha por amostra)
+  Encoding: UTF-8 (acentos em português corretos: já, não, você, etc.)
+  Linhas com formato segment_N|texto:  291
+
+  Observações:
+    - O formato está correto para o Prepare (nome|texto).
+    - Os textos estão em português e têm tamanho adequado (maior que 3 caracteres
+      nas linhas amostradas).
+
+--------------------------------------------------------------------------------
+3. DURAÇÕES E AMOSTRAS REJEITADAS NO PREPARE
+--------------------------------------------------------------------------------
+  Entradas em duration.json:  287
+  Linhas no metadata (segment_*):  291
+
+  Conclusão:  4 amostras do metadata foram rejeitadas durante o Prepare.
+  Possíveis causas (conforme o código do Prepare):
+    - Áudio com duração < 1 s ou > 30 s
+    - Texto com menos de 3 caracteres
+    - Arquivo de áudio ausente ou caminho incorreto em wavs/
+    - Erro ao obter duração do áudio
+
+  Recomendação: Verificar no relatório do Prepare (na UI) se foram listados
+  arquivos em erro. Se quiser usar as 291 amostras, corrija as 4 rejeitadas
+  (duração, texto ou presença do .wav) e rode o Prepare de novo.
+
+--------------------------------------------------------------------------------
+4. VOCAB.TXT
+--------------------------------------------------------------------------------
+  O código do F5-TTS exige que a primeira linha do vocab.txt seja um espaço
+  (índice 0 = caractere desconhecido).
+
+  No arquivo analisado, a primeira linha aparece em branco na leitura. Em
+  muitos editores, uma linha contendo só um espaço pode parecer vazia.
+  Se a primeira linha for realmente uma string vazia (e não um espaço), o
+  treino ou a inferência podem falhar com:
+    "make sure space is of idx 0 in vocab.txt"
+
+  Verificação feita: a primeira linha do vocab.txt tem um único espaço (OK).
+  Recomendação: Se em outro ambiente o treino reclamar de "space is of idx 0",
+  abra vocab.txt e confira se a linha 1 é exatamente um espaço; se estiver
+  vazia, edite e salve em UTF-8.
+
+--------------------------------------------------------------------------------
+5. NOME DO PROJETO E CASE (DOCKER / LINUX)
+--------------------------------------------------------------------------------
+  O nome da pasta está como  brPB22_g1bF01_char  (P e B maiúsculos).
+  No código, ao listar projetos na UI, o nome é passado em minúsculas em
+  alguns fluxos; ao montar o dataset, o path usa o nome da pasta como está.
+
+  No Windows isso não costuma dar problema. Em Docker/Linux, o sistema de
+  arquivos é case-sensitive:  data/brPB22_g1bF01_char  e
+  data/brpb22_g1bf01_char  seriam pastas diferentes. O checkpoint e o
+  dataset são salvos com o nome que o finetune_cli recebe (ex.: brpb22_g1bf01
+  após remoção do sufixo _char). Garanta que, ao treinar, o nome do projeto
+  escolhido na UI corresponda à pasta em data/ (ou use sempre o mesmo padrão
+  de maiúsculas/minúsculas).
+
+--------------------------------------------------------------------------------
+6. ALINHAMENTO COM firstpixelptbr (VOCAB)
+--------------------------------------------------------------------------------
+  Se você treina a partir do checkpoint firstpixelptbr, o vocab do projeto
+  deve ser idêntico ao do firstpixelptbr (mesmo conteúdo e ordem). O
+  vocab.txt atual foi gerado pelo Prepare a partir dos caracteres dos
+  textos do projeto (tokenizer char).
+
+  Se firstpixelptbr tiver um vocab diferente (outro tamanho ou ordem), o
+  treino pode falhar ao carregar o checkpoint ou gerar áudio ruim. Nesse
+  caso, substitua  data/brPB22_g1bF01_char/vocab.txt  pelo
+  ckpts/firstpixelptbr/vocab.txt  (garantindo que todos os caracteres dos
+  seus textos existam nesse vocab). Ver FIRSTPIXELPTBR.md.
+
+--------------------------------------------------------------------------------
+7. RESUMO — PROBLEMAS IDENTIFICADOS
+--------------------------------------------------------------------------------
+  1. Quatro amostras rejeitadas no Prepare (291 → 287). Verificar quais e
+     corrigir se quiser usá-las.
+  2. Confirmar que a primeira linha do vocab.txt é um espaço (índice 0).
+  3. Manter consistência de maiúsculas/minúsculas no nome do projeto ao
+     treinar (especialmente em Docker/Linux).
+  4. Se usar base firstpixelptbr, alinhar o vocab do projeto ao do base.
+
+--------------------------------------------------------------------------------
+8. SCRIPT DE VERIFICAÇÃO
+--------------------------------------------------------------------------------
+  Foi criado o script  scripts/check_training_project.py  para checagem
+  automática. Uso (na raiz do repositório):
+
+    python scripts/check_training_project.py brPB22_g1bF01_char
+
+  Ele verifica presença de metadata.csv, wavs/, raw.arrow, duration.json,
+  vocab.txt e aponta inconsistências (ex.: áudios referenciados e ausentes).
+
+================================================================================
+  Fim do relatório
+================================================================================

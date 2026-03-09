@@ -63,6 +63,21 @@ file_train = str(files("f5_tts").joinpath("train/finetune_cli.py"))
 
 # Default pretrain path (Docker); easy to copy or fill via "Use default path" button
 DEFAULT_PRETRAIN_CKPT = "/workspace/F5-TTS/ckpts/firstpixelptbr/model_last.pt"
+# Vocab F5-TTS base / firstpixelptbr (local; mesmo que inferência; funciona em Docker)
+path_default_vocab = str(files("f5_tts").joinpath("infer/examples/vocab.txt"))
+
+
+def _finetune_vocab_choices():
+    """Opções de vocab para Tokenizer File: vazio (do projeto), base local, ckpts/*/vocab.txt."""
+    choices = [""]
+    if os.path.isfile(path_default_vocab):
+        choices.append(path_default_vocab)
+    if os.path.isdir(path_project_ckpts):
+        for p in sorted(glob(os.path.join(path_project_ckpts, "*", "vocab.txt"))):
+            if p not in choices:
+                choices.append(p)
+    return choices
+
 
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -1590,7 +1605,12 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
 
             with gr.Row():
                 ch_finetune = bt_create = gr.Checkbox(label="Finetune", value=True)
-                tokenizer_file = gr.Textbox(label="Tokenizer File", value="")
+                tokenizer_file = gr.Dropdown(
+                    label="Tokenizer File (vocab): vazio = do projeto/Prepare; ou selecione F5-TTS base / firstpixelptbr",
+                    choices=_finetune_vocab_choices(),
+                    value="",
+                    allow_custom_value=True,
+                )
                 file_checkpoint_train = gr.Textbox(label="Path to the Pretrained Checkpoint", value="")
 
             with gr.Row():

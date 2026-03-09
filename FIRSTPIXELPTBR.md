@@ -26,8 +26,22 @@ Formato do `vocab.txt`: uma linha por caractere; a **primeira linha deve ser esp
 
 ### 1. Ter o vocab do firstpixelptbr
 
-- Se você tem o `vocab.txt` do firstpixelptbr, coloque em `ckpts/firstpixelptbr/vocab.txt`.
-- Se não tiver, é preciso obtê-lo de quem gerou o checkpoint firstpixelptbr; sem ele não dá para garantir compatibilidade.
+O repositório **firstpixel/F5-TTS-pt-br** no Hugging Face ([huggingface.co/firstpixel/F5-TTS-pt-br](https://huggingface.co/firstpixel/F5-TTS-pt-br)) contém apenas os checkpoints em `pt-br/` (model_last.pt, model_last.safetensors, model_200000.pt); **não há `vocab.txt` publicado** lá. A documentação indica que o modelo usa **o mesmo tokenizer que o F5-TTS original (SWivid)**.
+
+Você pode obter o vocab assim:
+
+- **Opção A — Dentro deste projeto:** O vocab padrão do F5-TTS base está em  
+  **`src/f5_tts/infer/examples/vocab.txt`**  
+  Copie para `ckpts/firstpixelptbr/vocab.txt`:
+  ```text
+  cp src/f5_tts/infer/examples/vocab.txt ckpts/firstpixelptbr/vocab.txt
+  ```
+  (crie a pasta `ckpts/firstpixelptbr/` se não existir.)
+
+- **Opção B — Hugging Face (SWivid F5-TTS base):**  
+  [huggingface.co/SWivid/F5-TTS/tree/main/F5TTS_Base](https://huggingface.co/SWivid/F5-TTS/tree/main/F5TTS_Base) — baixe o arquivo **`vocab.txt`** e salve como `ckpts/firstpixelptbr/vocab.txt`.
+
+- Se você tiver um `vocab.txt` fornecido diretamente pela firstpixel, use-o em `ckpts/firstpixelptbr/vocab.txt`.
 
 ### 2. Criar o projeto de dados
 

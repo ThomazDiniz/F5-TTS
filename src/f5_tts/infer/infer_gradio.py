@@ -69,6 +69,8 @@ DEFAULT_TTS_MODEL_CFG = [
 
 # ckpts workspace (local ou /workspace/F5-TTS/ckpts no Docker) para aparecer no dropdown
 _path_ckpts = str(files("f5_tts").joinpath("../../ckpts"))
+# Vocab F5-TTS base / firstpixelptbr (local; funciona em Docker)
+_path_default_vocab_local = str(files("f5_tts").joinpath("infer/examples/vocab.txt"))
 
 
 def _workspace_ckpt_choices():
@@ -82,11 +84,16 @@ def _workspace_ckpt_choices():
 
 
 def _workspace_vocab_choices():
+    """Vocab disponíveis: local (F5-TTS base), HF default, depois ckpts/*/vocab.txt (ex.: firstpixelptbr)."""
     out = []
+    if os.path.isfile(_path_default_vocab_local):
+        out.append(_path_default_vocab_local)
+    out.append(DEFAULT_TTS_MODEL_CFG[1])
     if os.path.isdir(_path_ckpts):
-        for p in glob(os.path.join(_path_ckpts, "*", "vocab.txt")):
-            out.append(p)
-    return sorted(out)
+        for p in sorted(glob(os.path.join(_path_ckpts, "*", "vocab.txt"))):
+            if p not in out:
+                out.append(p)
+    return out
 
 
 # load models
@@ -862,8 +869,8 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
             visible=False,
         )
         custom_vocab_path = gr.Dropdown(
-            choices=[DEFAULT_TTS_MODEL_CFG[1]] + _workspace_vocab_choices(),
-            value=load_last_used_custom()[1],
+            choices=_workspace_vocab_choices(),
+            value=load_last_used_custom()[1] if load_last_used_custom()[1] in _workspace_vocab_choices() else (_path_default_vocab_local if os.path.isfile(_path_default_vocab_local) else DEFAULT_TTS_MODEL_CFG[1]),
             allow_custom_value=True,
             label="Vocab: local_path | hf://user_id/repo_id/vocab_file",
             visible=False,
