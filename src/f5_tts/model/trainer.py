@@ -307,7 +307,7 @@ class Trainer:
         plt.close(fig)
         print(f"[trainer] Loss curve saved to {out_path}", flush=True)
 
-    def train(self, train_dataset: Dataset, num_workers=12, resumable_with_seed: int = None):
+    def train(self, train_dataset: Dataset, num_workers=4, resumable_with_seed: int = None):
         if self.accelerator.is_local_main_process:
             print("[trainer] train() started: preparing dataloader and scheduler...", flush=True)
         self._loss_history = []
@@ -479,6 +479,9 @@ class Trainer:
                     print(f"[trainer] End of epoch {epoch + 1}: saving checkpoint (save every {self.save_every_epochs} epochs).", flush=True)
                 self.save_checkpoint(global_step)
                 self.save_checkpoint(global_step, last=True)
+                if self.log_samples and self.accelerator.is_local_main_process:
+                    print(f"[trainer] Generating log samples at step {global_step} (may take a moment)...", flush=True)
+                self._generate_and_save_log_samples(global_step, batch)
 
         if self.accelerator.is_local_main_process:
             print("[trainer] Training loop finished. Saving final checkpoint...", flush=True)

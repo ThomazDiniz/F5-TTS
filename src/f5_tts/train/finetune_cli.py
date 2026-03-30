@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--num_warmup_updates", type=int, default=300, help="Warmup steps")
     parser.add_argument("--save_per_updates", type=int, default=10000, help="Save checkpoint every X steps")
-    parser.add_argument("--save_every_epochs", type=int, default=0, help="Save checkpoint at end of every N epochs (0 = use save_per_updates only)")
+    parser.add_argument("--save_every_epochs", type=int, default=2, help="Save checkpoint at end of every N epochs (0 = use save_per_updates only)")
     parser.add_argument("--last_per_steps", type=int, default=50000, help="Save last checkpoint every X steps")
     parser.add_argument("--finetune", action="store_true", help="Use Finetune")
     parser.add_argument("--pretrain", type=str, default=None, help="the path to the checkpoint")

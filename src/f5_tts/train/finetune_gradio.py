@@ -152,9 +152,9 @@ def load_settings(project_name):
             "max_grad_norm": 1,
             "epochs": 100,
             "num_warmup_updates": 2,
-            "save_per_updates": 300,
-            "last_per_steps": 100,
-            "save_every_epochs": 0,
+            "save_per_updates": 0,
+            "last_per_steps": 0,
+            "save_every_epochs": 2,
             "finetune": True,
             "file_checkpoint_train": "",
             "tokenizer_type": "char",
@@ -175,7 +175,7 @@ def load_settings(project_name):
             settings["num_warmup_updates"],
             settings["save_per_updates"],
             settings["last_per_steps"],
-            settings.get("save_every_epochs", 0),
+            settings.get("save_every_epochs", 2),
             settings["finetune"],
             settings["file_checkpoint_train"],
             settings["tokenizer_type"],
@@ -192,7 +192,7 @@ def load_settings(project_name):
         if "bnb_optimizer" not in settings:
             settings["bnb_optimizer"] = False
         if "save_every_epochs" not in settings:
-            settings["save_every_epochs"] = 0
+            settings["save_every_epochs"] = 2
     return (
         settings["exp_name"],
         settings["learning_rate"],
@@ -1644,12 +1644,28 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                 num_warmup_updates = gr.Number(label="Warmup Updates", value=2)
 
             with gr.Row():
-                save_per_updates = gr.Number(label="Save per Updates", value=300)
-                last_per_steps = gr.Number(label="Last per Steps", value=100)
-                save_every_epochs = gr.Number(
-                    label="Save every N epochs (0 = off, use Save per Updates)",
-                    value=0,
+                save_per_updates = gr.Number(label="Save per Updates (0 = off)", value=0)
+                last_per_steps = gr.Number(label="Last per Steps (0 = off)", value=0)
+                save_every_epochs = gr.Dropdown(
+                    label="Save every N epochs (0 = off, use Save per Updates / Last per Steps)",
+                    choices=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                    value=2,
                 )
+
+            def on_save_every_epochs_change(sel):
+                try:
+                    v = int(sel) if sel is not None else 0
+                except (TypeError, ValueError):
+                    v = 0
+                if v != 0:
+                    return 0, 0
+                return gr.NoUpdate(), gr.NoUpdate()
+
+            save_every_epochs.change(
+                fn=on_save_every_epochs_change,
+                inputs=[save_every_epochs],
+                outputs=[save_per_updates, last_per_steps],
+            )
 
             with gr.Row():
                 ch_8bit_adam = gr.Checkbox(label="Use 8-bit Adam optimizer")
@@ -1689,9 +1705,13 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                 max_grad_norm.value = max_grad_normv
                 epochs.value = epochsv
                 num_warmup_updates.value = num_warmupv_updatesv
-                save_per_updates.value = save_per_updatesv
-                last_per_steps.value = last_per_stepsv
                 save_every_epochs.value = save_every_epochsv
+                if save_every_epochsv and int(save_every_epochsv) != 0:
+                    save_per_updates.value = 0
+                    last_per_steps.value = 0
+                else:
+                    save_per_updates.value = save_per_updatesv
+                    last_per_steps.value = last_per_stepsv
                 ch_finetune.value = finetunev
                 file_checkpoint_train.value = file_checkpoint_trainv
                 tokenizer_type.value = tokenizer_typev
