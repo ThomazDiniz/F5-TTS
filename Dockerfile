@@ -18,8 +18,14 @@ WORKDIR /workspace
 COPY . /workspace/F5-TTS/
 WORKDIR /workspace/F5-TTS
 
-# Pin Gradio to 3.x (show_api and API compatibility); then install project
-RUN pip install --no-cache-dir "gradio>=3.45.2,<4.0.0" \
+# Pin Gradio to 3.x (show_api and API compatibility) AND pin web stack.
+# Newer FastAPI/Starlette/Jinja2 combos can break Gradio 3.x templates at runtime.
+RUN pip install --no-cache-dir \
+        "gradio==3.50.2" \
+        "fastapi==0.103.2" \
+        "starlette==0.27.0" \
+        "jinja2==3.1.4" \
+        "pydantic<2.0.0" \
     && pip install -e . --no-cache-dir \
     && pip install --no-cache-dir tensorboard
 

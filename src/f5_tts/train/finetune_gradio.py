@@ -713,7 +713,8 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
 
     if not user:
         if audio_files is None:
-            return "You need to load an audio file."
+            yield "You need to load an audio file."
+            return
 
     if os.path.isdir(path_project_wavs):
         shutil.rmtree(path_project_wavs)
@@ -730,7 +731,8 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
             for file in glob(os.path.join(path_dataset, format))
         ]
         if file_audios == []:
-            return "No audio file was found in the dataset."
+            yield "No audio file was found in the dataset."
+            return
     else:
         file_audios = audio_files
 
@@ -743,6 +745,7 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
     error_details = []  # list of (file_segment, error_msg) for logging and summary
     max_errors_logged = 20  # cap detailed errors in return message
     data = ""
+    yield "Starting transcription..."
     for file_audio in progress.tqdm(file_audios, desc="transcribe files", total=len((file_audios))):
         audio, _ = librosa.load(file_audio, sr=24000, mono=True)
 
@@ -762,6 +765,8 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
                 text = text.lower().strip().replace('"', "")
 
                 data += f"{name_segment}|{text}\n"
+                print(f"[TRANSCRIBE] {name_segment}|{text}", flush=True)
+                yield f"Transcribed: {name_segment}|{text}"
 
                 num += 1
             except Exception as e:  # noqa: BLE001
@@ -769,6 +774,8 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
                 err_msg = f"{type(e).__name__}: {e}"
                 logging.exception("Transcribe failed for %s: %s", file_segment, err_msg)
                 error_details.append((file_segment, err_msg))
+                print(f"[TRANSCRIBE][ERROR] {file_segment}: {err_msg}", flush=True)
+                yield f"Error transcribing {file_segment}: {err_msg}"
 
     with open(file_metadata, "w", encoding="utf-8-sig") as f:
         f.write(data)
@@ -783,7 +790,7 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
     else:
         error_text = ""
 
-    return f"transcribe complete samples : {num}\npath : {path_project_wavs}{error_text}"
+    yield f"transcribe complete samples : {num}\npath : {path_project_wavs}{error_text}"
 
 
 def format_seconds_to_hms(seconds):
@@ -1340,7 +1347,7 @@ def get_checkpoints_project(project_name, is_gradio=True):
 
 def get_audio_project(project_name, is_gradio=True):
     if project_name is None:
-        return [], ""
+        return [], None
     project_name = project_name.replace("_pinyin", "").replace("_char", "")
 
     if os.path.isdir(path_project_ckpts):
@@ -1430,7 +1437,7 @@ def get_audio_select(file_sample):
     select_audio_ref = file_sample
     select_audio_gen = file_sample
 
-    if file_sample is not None:
+    if file_sample:
         select_audio_ref += "_ref.wav"
         select_audio_gen += "_gen.wav"
 
@@ -1728,9 +1735,12 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
             select_audio_ref = select_audio
             select_audio_gen = select_audio
 
-            if select_audio is not None:
+            if select_audio:
                 select_audio_ref += "_ref.wav"
                 select_audio_gen += "_gen.wav"
+            else:
+                select_audio_ref = None
+                select_audio_gen = None
 
             with gr.Row():
                 ch_list_audio = gr.Dropdown(
@@ -1952,6 +1962,7 @@ Reduce the model size from 5GB to 1.3GB. The new checkpoint can be used for infe
 def main(port, host, share, api):
     global app
     print("Starting app...")
+    print("If you're running through Docker URL:  http://127.0.0.1:7861")
     app.queue(api_open=api).launch(server_name=host, server_port=port, share=share, show_api=api)
 
 
