@@ -116,6 +116,15 @@ class F5TTS:
         file_spect=None,
         seed=-1,
     ):
+        # Gradio often passes numeric inputs as float (e.g., 32.0). Sampling expects an integer step count.
+        try:
+            nfe_step = int(nfe_step)
+        except (TypeError, ValueError):
+            nfe_step = 32
+
+        if nfe_step < 1:
+            nfe_step = 1
+
         if seed == -1:
             seed = random.randint(0, sys.maxsize)
         seed_everything(seed)

@@ -2,6 +2,19 @@
 REM Finetune - firstpixel-f5tts:local -> http://localhost:7861
 REM Workspace: ckpts e data do host em /workspace/F5-TTS/ckpts e /workspace/F5-TTS/data
 cd /d "%~dp0"
+
+echo.
+echo [1/2] Build (sempre antes do run)...
+call "%~dp0build_docker.bat" nopause
+if errorlevel 1 (
+    echo.
+    echo Build falhou. Abortando run.
+    pause
+    exit /b 1
+)
+
+echo.
+echo [2/2] Run finetune...
 if not exist "ckpts" mkdir ckpts
 if not exist "data" mkdir data
 docker run --rm -it --gpus all -p 7861:7860 ^

@@ -1280,6 +1280,20 @@ def infer(
     if not os.path.isfile(file_checkpoint):
         return None, "checkpoint not found!"
 
+    # If texts are empty, auto-fill from STT using the project's transcribe().
+    ref_text_in = (ref_text or "").strip()
+    gen_text_in = (gen_text or "").strip()
+    if (not ref_text_in or not gen_text_in) and ref_audio:
+        try:
+            stt_text = (transcribe(ref_audio, None) or "").strip()
+        except Exception:
+            stt_text = ""
+        if stt_text:
+            if not ref_text_in:
+                ref_text_in = stt_text
+            if not gen_text_in:
+                gen_text_in = stt_text
+
     if training_process is not None:
         device_test = "cpu"
     else:
@@ -1305,8 +1319,8 @@ def infer(
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
         tts_api.infer(
-            gen_text=gen_text.lower().strip(),
-            ref_text=ref_text.lower().strip(),
+            gen_text=gen_text_in.lower().strip(),
+            ref_text=ref_text_in.lower().strip(),
             ref_file=ref_audio,
             nfe_step=nfe_step,
             file_wave=f.name,
@@ -1314,7 +1328,7 @@ def infer(
             seed=seed,
             remove_silence=remove_silence,
         )
-        return f.name, tts_api.device, str(tts_api.seed)
+        return f.name, tts_api.device, str(tts_api.seed), ref_text_in, gen_text_in
 
 
 def check_finetune(finetune):
@@ -1653,10 +1667,12 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
             with gr.Row():
                 save_per_updates = gr.Number(label="Save per Updates (0 = off)", value=0)
                 last_per_steps = gr.Number(label="Last per Steps (0 = off)", value=0)
-                save_every_epochs = gr.Dropdown(
+                save_every_epochs = gr.Number(
                     label="Save every N epochs (0 = off, use Save per Updates / Last per Steps)",
-                    choices=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
                     value=2,
+                    minimum=0,
+                    maximum=1000,
+                    step=1,
                 )
 
             def on_save_every_epochs_change(sel):
@@ -1864,6 +1880,12 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
             gr.Markdown("""```plaintext 
 SOS: Check the use_ema setting (True or False) for your model to see what works best for you. use seed -1 from random
 ```""")
+            gr.Markdown(
+                """```plaintext
+Auto-STT: Se "Ref Text" ou "Gen Text" estiverem vazios ao clicar "Infer", o sistema transcreve o "Audio Ref"
+com o STT do próprio projeto e preenche automaticamente os campos vazios com o texto inferido.
+```"""
+            )
             exp_name = gr.Radio(label="Model", choices=["F5-TTS", "E2-TTS"], value="F5-TTS")
             list_checkpoints, checkpoint_select = get_checkpoints_project(projects_selelect, False)
 
@@ -1912,7 +1934,7 @@ SOS: Check the use_ema setting (True or False) for your model to see what works 
                     seed,
                     remove_silence,
                 ],
-                outputs=[gen_audio, txt_info_gpu, seed_info],
+                outputs=[gen_audio, txt_info_gpu, seed_info, ref_text, gen_text],
             )
 
             bt_checkpoint_refresh.click(fn=get_checkpoints_project, inputs=[cm_project], outputs=[cm_checkpoint])

@@ -98,6 +98,14 @@ class CFM(nn.Module):
         edit_mask=None,
     ):
         self.eval()
+        # Sampling expects an integer number of steps, but some callers (e.g. Gradio) may pass floats like 32.0.
+        try:
+            steps = int(steps)
+        except (TypeError, ValueError):
+            steps = 32
+
+        if steps < 1:
+            steps = 1
         # raw wave
 
         if cond.ndim == 2:
