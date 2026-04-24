@@ -1,7 +1,6 @@
 import argparse
 import os
 import shutil
-import sys
 
 import torch
 from cached_path import cached_path
@@ -9,17 +8,6 @@ from f5_tts.model import CFM, UNetT, DiT, Trainer
 from f5_tts.model.utils import get_tokenizer
 from f5_tts.model.dataset import load_dataset
 from importlib.resources import files
-
-
-def _configure_stdio_for_live_logs() -> None:
-    """Com pipes/tee (PowerShell, CI) o stdout costuma ser block-buffered e o tqdm usa stderr por defeito."""
-    os.environ.setdefault("PYTHONUNBUFFERED", "1")
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(line_buffering=True)
-            except (OSError, ValueError, AttributeError):
-                pass
 
 
 # -------------------------- Dataset Settings --------------------------- #
@@ -89,30 +77,6 @@ def parse_args():
         action="store_true",
         help="Use 8-bit Adam optimizer from bitsandbytes",
     )
-    parser.add_argument(
-        "--experiment_report",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Gravar CSV/JSON em ckpts/<projeto>/experiment_report/ (tempos, perda, sistema).",
-    )
-    parser.add_argument(
-        "--experiment_log_every_n",
-        type=int,
-        default=1,
-        help="Registar timing/perda em ficheiros a cada N passos (1 = todos; use 5-50 em corridas muito longas).",
-    )
-    parser.add_argument(
-        "--log_samples_every_n_epochs",
-        type=int,
-        default=0,
-        help="Com --log_samples: gerar ref/gen wav em samples/ a cada N épocas (0 = só nos saves por step/epoch já existentes).",
-    )
-    parser.add_argument(
-        "--checkpoint_max_keep",
-        type=int,
-        default=10,
-        help="Máximo de ficheiros model_<step>.pt a manter (rotação por step); 0 = sem limite. model_last.pt não conta.",
-    )
 
     return parser.parse_args()
 
@@ -121,7 +85,6 @@ def parse_args():
 
 
 def main():
-    _configure_stdio_for_live_logs()
     args = parse_args()
     print("[finetune_cli] Starting finetune...", flush=True)
 
@@ -230,10 +193,6 @@ def main():
         last_per_steps=args.last_per_steps,
         save_every_epochs=args.save_every_epochs,
         bnb_optimizer=args.bnb_optimizer,
-        experiment_report=args.experiment_report,
-        experiment_log_every_n_steps=args.experiment_log_every_n,
-        log_samples_every_n_epochs=args.log_samples_every_n_epochs,
-        checkpoint_max_keep=args.checkpoint_max_keep,
     )
 
     print("[finetune_cli] Loading dataset (this may take a while)...", flush=True)

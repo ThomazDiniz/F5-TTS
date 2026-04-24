@@ -35,7 +35,7 @@ RUN pip install --no-cache-dir \
 # Workspace: montar no run com -v %cd%\ckpts:/workspace/F5-TTS/ckpts e -v %cd%\data:/workspace/F5-TTS/data
 RUN mkdir -p /workspace/F5-TTS/ckpts /workspace/F5-TTS/data
 
-EXPOSE 7860 6006
+EXPOSE 7860
 ENV SHELL=/bin/bash
 ENV F5TTS_WORKSPACE=/workspace/F5-TTS
 ENV F5TTS_CKPTS=/workspace/F5-TTS/ckpts

@@ -15,11 +15,6 @@ if errorlevel 1 (
 
 echo.
 echo [2/2] Run inference...
-echo.
-set "LOCAL_URL=http://127.0.0.1:7860/"
-echo URL local: "%LOCAL_URL%"
-echo Abrindo no navegador...
-start "" "%LOCAL_URL%"
 if not exist "ckpts" mkdir ckpts
 docker run --rm -it --gpus all -p 7860:7860 ^
   -v f5tts_hf_cache:/root/.cache/huggingface ^

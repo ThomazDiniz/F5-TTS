@@ -1,14 +1,7 @@
 from __future__ import annotations
 
-import csv
 import gc
-import json
 import os
-import re
-import shutil
-import platform
-import subprocess
-import sys
 import time
 
 import torch
@@ -23,13 +16,6 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 
 from f5_tts.model import CFM
-
-
-def _train_tqdm(iterable, **kwargs):
-    """tqdm por defeito escreve em stderr; com Tee só em stdout os progressos sumiam. Forçamos stdout + refresh."""
-    kw = dict(file=sys.stdout, mininterval=0.5, dynamic_ncols=True)
-    kw.update(kwargs)
-    return tqdm(iterable, **kw)
 from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
 
@@ -65,10 +51,6 @@ class Trainer:
         mel_spec_type: str = "vocos",  # "vocos" | "bigvgan"
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
-        experiment_report: bool = True,  # CSV/JSON/plots under checkpoint_path/experiment_report/
-        experiment_log_every_n_steps: int = 1,  # downsample step timing / loss rows (1 = every step)
-        log_samples_every_n_epochs: int = 0,  # if >0 and log_samples: ref/gen wav a cada N épocas (independente dos saves)
-        checkpoint_max_keep: int = 10,  # manter no máximo N ficheiros model_<step>.pt (0 = sem rotação)
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -121,7 +103,6 @@ class Trainer:
 
         self.epochs = epochs
         self.num_warmup_updates = num_warmup_updates
-        self._learning_rate_stored = learning_rate
         self.save_per_updates = save_per_updates
         self.save_every_epochs = save_every_epochs if save_every_epochs else 0
         self.last_per_steps = default(last_per_steps, save_per_updates * grad_accumulation_steps)
@@ -142,11 +123,6 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
 
-        self.experiment_report = experiment_report
-        self.experiment_log_every_n_steps = max(1, int(experiment_log_every_n_steps))
-        self.log_samples_every_n_epochs = max(0, int(log_samples_every_n_epochs))
-        self.checkpoint_max_keep = max(0, int(checkpoint_max_keep))
-
         if bnb_optimizer:
             import bitsandbytes as bnb
 
@@ -158,29 +134,6 @@ class Trainer:
     @property
     def is_main(self):
         return self.accelerator.is_main_process
-
-    def _rotate_numbered_checkpoints(self) -> None:
-        """Remove model_<step>.pt antigos; mantém os checkpoint_max_keep mais recentes. model_last.pt nunca é apagado."""
-        if not self.is_main or self.checkpoint_max_keep <= 0:
-            return
-        ckpt_dir = self.checkpoint_path
-        if not os.path.isdir(ckpt_dir):
-            return
-
-        pat = re.compile(r"^model_(\d+)\.pt$")
-        pairs: list[tuple[int, str]] = []
-        for f in os.listdir(ckpt_dir):
-            m = pat.match(f)
-            if m:
-                pairs.append((int(m.group(1)), f))
-        pairs.sort(key=lambda x: x[0], reverse=True)
-        for _, old in pairs[self.checkpoint_max_keep :]:
-            path = os.path.join(ckpt_dir, old)
-            try:
-                os.remove(path)
-                print(f"[trainer] checkpoint rotation: removed {old} (keeping last {self.checkpoint_max_keep} numbered ckpts)", flush=True)
-            except OSError as e:
-                print(f"[trainer] checkpoint rotation: could not remove {old}: {e}", flush=True)
 
     def save_checkpoint(self, step, last=False):
         self.accelerator.wait_for_everyone()
@@ -202,7 +155,6 @@ class Trainer:
             else:
                 print(f"Saving checkpoint at step {step}...", flush=True)
                 self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_{step}.pt")
-                self._rotate_numbered_checkpoints()
             del checkpoint
             gc.collect()
         self.accelerator.wait_for_everyone()
@@ -283,198 +235,6 @@ class Trainer:
         gc.collect()
         return step
 
-    def _experiment_dir(self) -> str:
-        return os.path.join(self.checkpoint_path, "experiment_report")
-
-    def _append_csv(self, filename: str, row: list, header: list[str]) -> None:
-        path = os.path.join(self._experiment_dir(), filename)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        empty = not os.path.isfile(path) or os.path.getsize(path) == 0
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if empty:
-                w.writerow(header)
-            w.writerow(row)
-
-    def _collect_system_info_dict(self) -> dict:
-        d: dict = {
-            "collected_at_unix": time.time(),
-            "platform": platform.platform(),
-            "system": platform.system(),
-            "node": platform.node(),
-            "machine": platform.machine(),
-            "processor": platform.processor() or "",
-            "python_version": sys.version,
-        }
-        try:
-            import torch
-
-            d["torch_version"] = torch.__version__
-            d["cuda_available"] = torch.cuda.is_available()
-            if torch.cuda.is_available():
-                d["cuda_device_count"] = torch.cuda.device_count()
-                d["cuda_device_0_name"] = torch.cuda.get_device_name(0)
-                d["cuda_device_0_capability"] = str(torch.cuda.get_device_capability(0))
-                d["cuda_version"] = getattr(torch.version, "cuda", None)
-        except Exception as e:
-            d["torch_error"] = repr(e)
-        try:
-            import psutil
-
-            vm = psutil.virtual_memory()
-            d["ram_total_gb"] = round(vm.total / (1024**3), 3)
-            d["ram_available_gb"] = round(vm.available / (1024**3), 3)
-            d["cpu_count_logical"] = psutil.cpu_count(logical=True)
-            d["cpu_count_physical"] = psutil.cpu_count(logical=False)
-        except Exception:
-            pass
-        try:
-            r = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-            if r.returncode == 0:
-                d["nvidia_smi"] = r.stdout.strip()
-        except Exception:
-            pass
-        try:
-            r = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=os.getcwd(),
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if r.returncode == 0:
-                d["git_commit"] = r.stdout.strip()
-        except Exception:
-            pass
-        return d
-
-    def _write_system_info_json(self) -> None:
-        if not self.is_main or not self.experiment_report:
-            return
-        os.makedirs(self._experiment_dir(), exist_ok=True)
-        path = os.path.join(self._experiment_dir(), "system_info.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self._collect_system_info_dict(), f, ensure_ascii=False, indent=2)
-        print(f"[trainer] experiment_report: wrote {path}", flush=True)
-
-    def _write_run_config_json(
-        self,
-        n_samples: int,
-        batches_per_epoch: int,
-        total_epochs: int,
-        train_dataset_repr: str,
-    ) -> None:
-        if not self.is_main or not self.experiment_report:
-            return
-        cfg = {
-            "n_audio_samples": n_samples,
-            "batches_per_epoch": batches_per_epoch,
-            "epochs": total_epochs,
-            "batch_size_type": self.batch_size_type,
-            "batch_size_per_gpu": self.batch_size,
-            "max_samples": self.max_samples,
-            "grad_accumulation_steps": self.grad_accumulation_steps,
-            "learning_rate": getattr(self, "_learning_rate_stored", None),
-            "num_warmup_updates": self.num_warmup_updates,
-            "save_per_updates": self.save_per_updates,
-            "save_every_epochs": self.save_every_epochs,
-            "checkpoint_max_keep": self.checkpoint_max_keep,
-            "last_per_steps": self.last_per_steps,
-            "logger": self.logger,
-            "log_samples": self.log_samples,
-            "log_samples_every_n_epochs": self.log_samples_every_n_epochs,
-            "train_dataset": train_dataset_repr,
-        }
-        path = os.path.join(self._experiment_dir(), "run_config.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        print(f"[trainer] experiment_report: wrote {path}", flush=True)
-
-    def _write_time_estimate_json(
-        self,
-        epoch_just_finished: int,
-        epoch_duration_sec: float,
-        batches_in_epoch: int,
-        epochs_remaining: int,
-        global_step: int,
-    ) -> None:
-        if not self.is_main or not self.experiment_report:
-            return
-        if batches_in_epoch <= 0:
-            return
-        sec_per_batch = epoch_duration_sec / batches_in_epoch
-        est_remaining_sec = sec_per_batch * batches_in_epoch * epochs_remaining
-        elapsed_sec = time.perf_counter() - getattr(self, "_train_wall_start", time.perf_counter())
-        payload = {
-            "after_epoch": epoch_just_finished,
-            "global_step": global_step,
-            "epoch_duration_sec": round(epoch_duration_sec, 3),
-            "batches_in_epoch": batches_in_epoch,
-            "mean_sec_per_batch": round(sec_per_batch, 6),
-            "estimated_remaining_sec": round(est_remaining_sec, 1),
-            "estimated_remaining_hours": round(est_remaining_sec / 3600.0, 2),
-            "elapsed_wall_time_sec": round(elapsed_sec, 1),
-            "estimated_total_wall_sec_approx": round(elapsed_sec + est_remaining_sec, 1),
-            "note": "Estimativa linear a partir da última época completa; primeira época pode ser mais lenta (warmup de dados).",
-        }
-        path = os.path.join(self._experiment_dir(), "time_estimate.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(
-            f"[trainer] time_estimate: ~{payload['estimated_remaining_hours']} h restantes "
-            f"({epochs_remaining} epocas), ~{payload['mean_sec_per_batch']:.4f} s/batch",
-            flush=True,
-        )
-
-    def _export_loss_and_timing_csvs(self) -> None:
-        if not self.is_main or not self.experiment_report:
-            return
-        ed = self._experiment_dir()
-        os.makedirs(ed, exist_ok=True)
-        if self._loss_history:
-            p = os.path.join(ed, "loss_by_step.csv")
-            with open(p, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["global_step", "loss"])
-                w.writerows(self._loss_history)
-            print(f"[trainer] experiment_report: wrote {p}", flush=True)
-        if getattr(self, "_epoch_loss_history", []):
-            p2 = os.path.join(ed, "loss_by_epoch.csv")
-            with open(p2, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["epoch", "mean_loss"])
-                w.writerows(self._epoch_loss_history)
-            print(f"[trainer] experiment_report: wrote {p2}", flush=True)
-
-    def _write_statistics_summary_json(self, total_wall_sec: float) -> None:
-        if not self.is_main or not self.experiment_report:
-            return
-        losses = [x[1] for x in self._loss_history] if self._loss_history else []
-        ep_losses = [x[1] for x in getattr(self, "_epoch_loss_history", [])]
-        summary = {
-            "loss_history_subsample_every_n_steps": self.experiment_log_every_n_steps,
-            "total_training_wall_time_sec": round(total_wall_sec, 3),
-            "total_training_wall_time_hours": round(total_wall_sec / 3600.0, 4),
-            "num_loss_points": len(losses),
-            "loss_min": min(losses) if losses else None,
-            "loss_max": max(losses) if losses else None,
-            "loss_final": losses[-1] if losses else None,
-            "epoch_mean_loss_final": ep_losses[-1] if ep_losses else None,
-            "epoch_mean_loss_best": min(ep_losses) if ep_losses else None,
-            "num_epochs_logged": len(ep_losses),
-        }
-        if len(ep_losses) >= 10:
-            summary["epoch_mean_loss_mean_last_10"] = sum(ep_losses[-10:]) / 10.0
-        path = os.path.join(self._experiment_dir(), "statistics_summary.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
-        print(f"[trainer] experiment_report: wrote {path}", flush=True)
-
     def _generate_and_save_log_samples(self, global_step: int, batch: dict):
         """Generate and save ref/gen audio samples (only when log_samples=True and on main process)."""
         if not self.log_samples or not self.accelerator.is_local_main_process:
@@ -521,8 +281,8 @@ class Trainer:
         print(f"[trainer] Log samples saved for step {global_step}. Total: {t4-t0:.1f}s (diffusion: {t2-t1:.1f}s, vocoder: {t3-t2:.1f}s, save: {t4-t3:.1f}s)", flush=True)
 
     def _plot_loss_curve(self):
-        """Plot loss vs global step and vs epoch; save under checkpoint_path/graphics/."""
-        if not self._loss_history and not getattr(self, "_epoch_loss_history", []):
+        """Plot training loss vs step and save to checkpoint_path/graphics/loss.png."""
+        if not self._loss_history:
             return
         try:
             import matplotlib
@@ -531,50 +291,26 @@ class Trainer:
         except ImportError:
             print("[trainer] matplotlib not available, skipping loss plot.", flush=True)
             return
+        steps = [h[0] for h in self._loss_history]
+        losses = [h[1] for h in self._loss_history]
         graphics_dir = os.path.join(self.checkpoint_path, "graphics")
         os.makedirs(graphics_dir, exist_ok=True)
-
-        if self._loss_history:
-            steps = [h[0] for h in self._loss_history]
-            losses = [h[1] for h in self._loss_history]
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(steps, losses, linewidth=0.8, color="#1f77b4")
-            ax.set_xlabel("Step (global)")
-            ax.set_ylabel("Loss")
-            ax.set_title("Training loss vs. step")
-            ax.grid(True, alpha=0.3)
-            fig.tight_layout()
-            out_path = os.path.join(graphics_dir, "loss.png")
-            fig.savefig(out_path, dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            print(f"[trainer] Loss vs step saved to {out_path}", flush=True)
-
-        epoch_hist = getattr(self, "_epoch_loss_history", [])
-        if epoch_hist:
-            epochs_ = [h[0] for h in epoch_hist]
-            losses_e = [h[1] for h in epoch_hist]
-            fig2, ax2 = plt.subplots(figsize=(10, 5))
-            ax2.plot(epochs_, losses_e, marker="o", linewidth=1.2, color="#ff7f0e")
-            ax2.set_xlabel("Epoch")
-            ax2.set_ylabel("Mean loss (per-batch average)")
-            ax2.set_title("Training loss vs. epoch")
-            ax2.grid(True, alpha=0.3)
-            if len(epochs_) <= 50:
-                ax2.set_xticks(epochs_)
-            fig2.tight_layout()
-            out_path2 = os.path.join(graphics_dir, "loss_by_epoch.png")
-            fig2.savefig(out_path2, dpi=150, bbox_inches="tight")
-            plt.close(fig2)
-            print(f"[trainer] Loss vs epoch saved to {out_path2}", flush=True)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(steps, losses, linewidth=0.8, color="#1f77b4")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Loss")
+        ax.set_title("Training loss over time")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        out_path = os.path.join(graphics_dir, "loss.png")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[trainer] Loss curve saved to {out_path}", flush=True)
 
     def train(self, train_dataset: Dataset, num_workers=4, resumable_with_seed: int = None):
         if self.accelerator.is_local_main_process:
             print("[trainer] train() started: preparing dataloader and scheduler...", flush=True)
         self._loss_history = []
-        self._epoch_loss_history = []
-        self._train_wall_start = time.perf_counter()
-        if self.experiment_report and self.is_main:
-            self._write_system_info_json()
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -645,29 +381,6 @@ class Trainer:
         if self.accelerator.is_local_main_process:
             print(f"[trainer] Starting from step {global_step}. Entering epoch loop.", flush=True)
 
-        n_samples = len(train_dataset)
-        batches_per_epoch = len(train_dataloader)
-        if self.experiment_report and self.is_main:
-            self._write_run_config_json(
-                n_samples,
-                batches_per_epoch,
-                self.epochs,
-                repr(train_dataset)[:800],
-            )
-            pre_path = os.path.join(self._experiment_dir(), "dataset_estimate.json")
-            total_batches = batches_per_epoch * self.epochs
-            est_note = {
-                "n_audio_samples": n_samples,
-                "batches_per_epoch": batches_per_epoch,
-                "epochs_configured": self.epochs,
-                "total_dataloader_iterations": total_batches,
-                "rough_steps_optimizer": int(total_batches / max(1, self.grad_accumulation_steps)),
-                "how_to_estimate_time": "Depois da 1ª época, veja time_estimate.json (mean_sec_por_batch × batches × épocas_restantes).",
-            }
-            with open(pre_path, "w", encoding="utf-8") as f:
-                json.dump(est_note, f, ensure_ascii=False, indent=2)
-            print(f"[trainer] experiment_report: wrote {pre_path}", flush=True)
-
         if exists(resumable_with_seed):
             orig_epoch_step = len(train_dataloader)
             total_steps_this_run = int(orig_epoch_step * self.epochs / self.grad_accumulation_steps)
@@ -690,15 +403,11 @@ class Trainer:
             total_steps_this_run = int(len(train_dataloader) * self.epochs / self.grad_accumulation_steps)
 
         for epoch in range(skipped_epoch, self.epochs):
-            epoch_loss_sum = 0.0
-            epoch_loss_count = 0
             if self.accelerator.is_local_main_process:
                 print(f"[trainer] Epoch {epoch + 1}/{self.epochs} started.", flush=True)
             self.model.train()
-            epoch_wall_start = time.perf_counter()
-            iter_wall_prev = time.perf_counter()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
-                progress_bar = _train_tqdm(
+                progress_bar = tqdm(
                     skipped_dataloader,
                     desc=f"Epoch {epoch+1}/{self.epochs}",
                     unit="step",
@@ -707,7 +416,7 @@ class Trainer:
                     total=orig_epoch_step,
                 )
             else:
-                progress_bar = _train_tqdm(
+                progress_bar = tqdm(
                     train_dataloader,
                     desc=f"Epoch {epoch+1}/{self.epochs}",
                     unit="step",
@@ -743,29 +452,11 @@ class Trainer:
                 global_step += 1
 
                 if self.accelerator.is_local_main_process:
-                    loss_val = float(loss.item())
-                    if global_step % self.experiment_log_every_n_steps == 0 or not self._loss_history:
-                        self._loss_history.append((global_step, loss_val))
-                    epoch_loss_sum += loss_val
-                    epoch_loss_count += 1
+                    self._loss_history.append((global_step, float(loss.item())))
                     self.accelerator.log({"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_step)
                     if self.logger == "tensorboard":
-                        self.writer.add_scalar("loss", loss_val, global_step)
+                        self.writer.add_scalar("loss", loss.item(), global_step)
                         self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_step)
-                    if self.experiment_report:
-                        t_now = time.perf_counter()
-                        dt_iter = t_now - iter_wall_prev
-                        iter_wall_prev = t_now
-                        if global_step % self.experiment_log_every_n_steps == 0:
-                            self._append_csv(
-                                "step_timing.csv",
-                                [global_step, f"{dt_iter:.8f}", f"{loss_val:.8f}"],
-                                ["global_step", "wall_time_sec_since_prev_iter", "loss"],
-                            )
-                        if self.logger == "tensorboard" and global_step % max(
-                            1, self.experiment_log_every_n_steps * 20
-                        ) == 0:
-                            self.writer.add_scalar("timing/sec_per_iter", dt_iter, global_step)
 
                 progress_bar.set_postfix(step=str(global_step), loss=loss.item())
 
@@ -780,56 +471,6 @@ class Trainer:
                     self.save_checkpoint(global_step, last=True)
                     if self.log_samples and self.accelerator.is_local_main_process:
                         print(f"[trainer] Generating log samples at step {global_step} (may take a moment)...", flush=True)
-                    self._generate_and_save_log_samples(global_step, batch)
-
-            if self.accelerator.is_local_main_process and epoch_loss_count > 0:
-                epoch_mean = epoch_loss_sum / epoch_loss_count
-                self._epoch_loss_history.append((epoch + 1, epoch_mean))
-                if self.logger == "tensorboard":
-                    self.writer.add_scalar("loss/epoch_mean", epoch_mean, epoch + 1)
-                    self.writer.flush()
-                if self.logger == "wandb":
-                    self.accelerator.log({"loss_epoch_mean": epoch_mean}, step=global_step)
-                print(
-                    f"[trainer] Epoch {epoch + 1}/{self.epochs} finished. "
-                    f"mean_loss={epoch_mean:.6f}  batches_this_epoch={epoch_loss_count}  global_step={global_step}",
-                    flush=True,
-                )
-                epoch_duration = time.perf_counter() - epoch_wall_start
-                if self.experiment_report:
-                    self._append_csv(
-                        "epoch_timing.csv",
-                        [
-                            epoch + 1,
-                            f"{epoch_duration:.3f}",
-                            epoch_loss_count,
-                            f"{epoch_mean:.8f}",
-                            global_step,
-                        ],
-                        ["epoch", "wall_time_sec", "batches_in_epoch", "mean_loss", "global_step_end"],
-                    )
-                    self._write_time_estimate_json(
-                        epoch + 1,
-                        epoch_duration,
-                        epoch_loss_count,
-                        max(0, self.epochs - (epoch + 1)),
-                        global_step,
-                    )
-
-            # Amostras ref/gen por época (ex.: a cada 2 épocas), sem exigir checkpoint nesse instante
-            if (
-                self.log_samples
-                and self.log_samples_every_n_epochs > 0
-                and epoch_loss_count > 0
-                and (epoch + 1) % self.log_samples_every_n_epochs == 0
-            ):
-                skip_dup = self.save_every_epochs > 0 and (epoch + 1) % self.save_every_epochs == 0
-                if not skip_dup and self.accelerator.is_local_main_process:
-                    print(
-                        f"[trainer] Log samples (every {self.log_samples_every_n_epochs} epochs) — "
-                        f"epoch {epoch + 1}/{self.epochs}, step {global_step}...",
-                        flush=True,
-                    )
                     self._generate_and_save_log_samples(global_step, batch)
 
             # Save at end of every N epochs (if set)
@@ -849,20 +490,6 @@ class Trainer:
             print("[trainer] Calling accelerator.end_training()...", flush=True)
         self.accelerator.end_training()
         if self.accelerator.is_local_main_process:
-            total_wall = time.perf_counter() - getattr(self, "_train_wall_start", time.perf_counter())
-            if self.experiment_report:
-                self._export_loss_and_timing_csvs()
-                self._write_statistics_summary_json(total_wall)
-            if self._loss_history or self._epoch_loss_history:
+            if self._loss_history:
                 self._plot_loss_curve()
-                if self.experiment_report:
-                    for png in ("loss.png", "loss_by_epoch.png"):
-                        src = os.path.join(self.checkpoint_path, "graphics", png)
-                        if os.path.isfile(src):
-                            dst = os.path.join(self._experiment_dir(), png)
-                            shutil.copy2(src, dst)
-                            print(f"[trainer] experiment_report: copied {src} -> {dst}", flush=True)
-            if self.logger == "tensorboard" and getattr(self, "writer", None) is not None:
-                self.writer.flush()
-                self.writer.close()
             print("[trainer] Training done.", flush=True)
