@@ -8,10 +8,21 @@ sys.path.append(f"{os.path.dirname(os.path.abspath(__file__))}/../../third_party
 
 import hashlib
 import re
+import shutil
+import subprocess
 import tempfile
+import wave
 from importlib.resources import files
 
+import librosa
+import soundfile as sf
 import matplotlib
+
+# HuggingFace ASR: path local em str -> open+ffmpeg_read(bytes). Se o ffmpeg devolver 0 amostras,
+# levanta o mesmo ValueError falso "Soundfile is either not in the correct format or is malformed"
+# (vem de transformers.pipelines.audio_utils.ffmpeg_read — NÃO do soundfile).
+# Ver: https://github.com/Vaibhavs10/insanely-fast-whisper/issues/90 (muitas vezes ffmpeg/libs quebrados).
+# Evitamos: só passar dict {raw, sampling_rate} carregado com soundfile/numpy.
 
 matplotlib.use("Agg")
 
@@ -133,6 +144,74 @@ def load_vocoder(vocoder_name="vocos", is_local=False, local_path="", device=dev
 # load asr pipeline
 
 asr_pipe = None
+_asr_ffmpeg_env_logged = False
+
+
+def _log_ffmpeg_environment_and_transformers() -> None:
+    """Diagnóstico: o erro 'Soundfile is malformed' no ASR do HF vem muitas vezes de ffmpeg a devolver 0 bytes."""
+    global _asr_ffmpeg_env_logged
+    if _asr_ffmpeg_env_logged:
+        return
+    _asr_ffmpeg_env_logged = True
+    try:
+        import transformers
+
+        _asr_transcribe_log(
+            f"env: transformers={getattr(transformers, '__version__', '?')} "
+            f"torch={torch.__version__} torchaudio={torchaudio.__version__}"
+        )
+    except Exception as e:  # noqa: BLE001
+        _asr_transcribe_log(f"env: nao foi possivel ler versoes: {e}")
+    exe = shutil.which("ffmpeg")
+    _asr_transcribe_log(f"env: ffmpeg which={exe!r} (necessario se o HF pipeline passar ficheiro por str; com dict numpy normalmente basta; se o ffmpeg no sistema estiver partido, ver github.com/Vaibhavs10/insanely-fast-whisper/issues/90)")
+    if not exe:
+        _asr_transcribe_log("env: AVISO — ffmpeg nao esta no PATH. No Docker a imagem ja inclui; no Windows, instala ffmpeg (winget/choco) ou conda-forge: ffmpeg")
+        return
+    try:
+        p = subprocess.run(
+            [exe, "-version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        first = (p.stdout or "").splitlines()[:1]
+        _asr_transcribe_log(f"env: ffmpeg -version rc={p.returncode} {first!r}")
+    except Exception as e:  # noqa: BLE001
+        _asr_transcribe_log(f"env: ffmpeg -version FALHOU: {e}")
+    # Teste rápido: decodificar 0,1s de sinal (falha se ffmpeg/libs estiverem partidos, como no issue #90)
+    try:
+        r2 = subprocess.run(
+            [
+                exe,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=16000:duration=0.1",
+                "-f",
+                "f32le",
+                "-ac",
+                "1",
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=15,
+        )
+        n = int(len(r2.stdout) // 4)  # float32
+        if r2.returncode != 0 or n == 0:
+            _asr_transcribe_log(
+                f"env: teste lavfi->pipe FALHOU (rc={r2.returncode} samples~{n} stderr={(r2.stderr or b'').decode(errors='replace')[:400]!r}) — o teu ffmpeg pode estar partido; reinstala."
+            )
+        else:
+            _asr_transcribe_log(f"env: teste ffmpeg lavfi ok (~{n} amostras float32)")
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        _asr_transcribe_log(
+            f"env: teste lavfi nao executado (normal em Windows sem lavfi, etc.): {e}"
+        )
 
 
 def initialize_asr_pipeline(device: str = device, dtype=None):
@@ -145,6 +224,7 @@ def initialize_asr_pipeline(device: str = device, dtype=None):
             else torch.float32
         )
     global asr_pipe
+    _log_ffmpeg_environment_and_transformers()
     print("[ASR] Loading Whisper model (first time may take a minute)...", flush=True)
     asr_pipe = pipeline(
         "automatic-speech-recognition",
@@ -159,17 +239,414 @@ def initialize_asr_pipeline(device: str = device, dtype=None):
 # transcribe
 
 
+def _asr_transcribe_log(msg: str) -> None:
+    line = f"[F5TTS-ASR] {msg}"
+    print(line, flush=True)
+    print(line, file=sys.stderr, flush=True)
+
+
+def _looks_like_hf_ffmpeg_read_error(err_text: str) -> bool:
+    """A mensagem 'Soundfile' vem muitas vezes de `transformers.pipelines.audio_utils.ffmpeg_read`, não do ficheiro."""
+    t = (err_text or "").lower()
+    return (
+        "not in the correct format" in t
+        or "malformed" in t
+        or "soundfile" in t
+        or "valid audio file extension" in t
+        or (("full address" in t) and ("download" in t))
+    )
+
+
+def _resample_mono_f32_inmemory(x: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Reamostra só com torchaudio (sem librosa; evita efeitos secundários de stack de áudio no path ASR)."""
+    if int(orig_sr) == int(target_sr):
+        return np.asarray(x, dtype=np.float32)
+    t = torch.from_numpy(np.asarray(x, dtype=np.float32).copy()).unsqueeze(0)
+    t = torchaudio.functional.resample(t, int(orig_sr), int(target_sr))
+    return t.squeeze(0).numpy()
+
+
+def _load_wav_stdlib_float_mono_native(p: str) -> tuple[np.ndarray, int]:
+    """RIFF WAVE PCM 8/16/32-bit, mono float32, **sample rate do ficheiro** (sem reamostrar)."""
+    with wave.open(p, "rb") as w:
+        nch = w.getnchannels()
+        sw = w.getsampwidth()
+        sr = w.getframerate()
+        n = w.getnframes()
+        raw = w.readframes(n)
+    if nch < 1 or nch > 2:
+        raise ValueError(f"canais nao suportado: {nch}")
+    if sw == 1:
+        x = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+    elif sw == 2:
+        x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sw == 4:
+        x = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"PCM sample width nao suportado: {sw}")
+    if nch == 2:
+        x = x.reshape(-1, 2).mean(axis=1)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return x.astype(np.float32), int(sr)
+
+
+def _load_wav_stdlib_float_mono(p: str) -> tuple[np.ndarray, int]:
+    """
+    RIFF WAVE com PCM (8/16/32-bit) — só stdlib, sem soundfile (útil no Windows com DLL/codec estranhos).
+    Deprecado para leitura genérica: preferir _load_wav_stdlib_float_mono_native + resample.
+    """
+    x, sr = _load_wav_stdlib_float_mono_native(p)
+    if int(sr) != 16000:
+        _asr_transcribe_log(f"LOAD stdlib: resample {int(sr)} -> 16000")
+        x = _resample_mono_f32_inmemory(x, int(sr), 16000)
+        sr = 16000
+    return x.astype(np.float32), int(sr)
+
+
+def _load_mono_torchaudio_native(p: str) -> tuple[np.ndarray, int]:
+    """torchaudio.read, mono float32, **taxa nativa** do ficheiro."""
+    wav, sr = torchaudio.load(p)
+    if wav.size(0) > 1:
+        wav = wav.mean(dim=0)
+    else:
+        wav = wav.squeeze(0)
+    x = wav.cpu().numpy().astype(np.float32)
+    return x, int(sr)
+
+
+def _load_mono_16k_torchaudio_path(p: str) -> tuple[np.ndarray, int]:
+    x, sr = _load_mono_torchaudio_native(p)
+    if int(sr) != 16000:
+        t = torch.from_numpy(x).unsqueeze(0)
+        t = torchaudio.functional.resample(t, int(sr), 16000)
+        x = t.squeeze(0).numpy()
+        sr = 16000
+    return x, int(sr)
+
+
+def _read_wav_mono_native(path: str) -> tuple[np.ndarray, int]:
+    """
+    Lê ficheiro de áudio: soundfile -> stdlib wave -> torchaudio, mono float32, **taxa nativa**.
+    Não chama librosa.load. Usado por ASR (16 kHz) e por finetune (ex.: 24 kHz).
+    """
+    import traceback
+
+    p = os.path.abspath(os.path.normpath(path))
+    _asr_transcribe_log(f"READ native: path={p!r}")
+    if not os.path.isfile(p):
+        raise FileNotFoundError(p)
+    if os.path.getsize(p) < 100:
+        raise ValueError("WAV muito pequeno")
+    # 1) soundfile
+    try:
+        info = sf.info(p)
+        _asr_transcribe_log(
+            f"READ: sf.info frames={info.frames} sr={info.samplerate} ch={getattr(info, 'channels', '?')}"
+        )
+        data, sr = sf.read(p, dtype="float32", always_2d=False)
+        if hasattr(data, "ndim") and data.ndim == 2:
+            data = np.mean(data, axis=1, dtype=np.float32)
+        data = np.nan_to_num(np.asarray(data, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        if data.size < 8:
+            raise ValueError("muito curto")
+        n = int(data.shape[0])
+        _asr_transcribe_log(f"READ: soundfile OK len={n} sr={sr}")
+        return data, int(sr)
+    except Exception as e:
+        _asr_transcribe_log(f"READ: soundfile FAIL {type(e).__name__}: {e} — fallback")
+        traceback.print_exc()
+    # 2) stdlib
+    try:
+        y, srr = _load_wav_stdlib_float_mono_native(p)
+        if len(y) < 8:
+            raise ValueError("muito curto")
+        _asr_transcribe_log(f"READ: stdlib OK len={len(y)} sr={srr}")
+        return y, srr
+    except Exception as e2:
+        _asr_transcribe_log(f"READ: stdlib FAIL {type(e2).__name__}: {e2}")
+        traceback.print_exc()
+    # 3) torchaudio
+    try:
+        y, srr = _load_mono_torchaudio_native(p)
+        if len(y) < 8:
+            raise ValueError("muito curto")
+        _asr_transcribe_log(f"READ: torchaudio OK len={len(y)} sr={srr}")
+        return y, srr
+    except Exception as e3:
+        _asr_transcribe_log(f"READ: torchaudio FAIL {type(e3).__name__}: {e3}")
+        traceback.print_exc()
+    raise RuntimeError(
+        "Nao foi possivel ler o ficheiro (soundfile, stdlib e torchaudio falharam). "
+        "Re-exporta a PCM 16 bit ou reinstala soundfile/torchaudio."
+    )
+
+
+def load_wav_path_mono_f32(path: str, target_sample_rate: int) -> np.ndarray:
+    """
+    Carga única p/ pipeline Gradio (slicing a 24 k): **não** usar librosa.load no path
+    (no Windows o mesmo ValueError falso acontece no passo 1, antes de segment_*.wav / ASR).
+    """
+    p = os.path.abspath(os.path.normpath(path))
+    y, sr = _read_wav_mono_native(p)
+    if int(sr) == int(target_sample_rate):
+        return np.ascontiguousarray(y, dtype=np.float32)
+    print(
+        f"[F5TTS-LOAD] load_wav_path_mono_f32: resample {int(sr)} -> {int(target_sample_rate)} {p!r}",
+        flush=True,
+    )
+    y = _resample_mono_f32_inmemory(y, int(sr), int(target_sample_rate))
+    return np.ascontiguousarray(y, dtype=np.float32)
+
+
+def _load_mono_16k_for_asr(path: str) -> tuple[np.ndarray, int]:
+    """
+    Carrega àudio para o Whisper a 16 kHz. NUNCA chamar librosa.load(ficheiro).
+    """
+    p = os.path.abspath(os.path.normpath(path))
+    _asr_transcribe_log(f"LOAD ASR: path={p!r}")
+    y, sr = _read_wav_mono_native(p)
+    if len(y) < 32:
+        raise ValueError(f"Audio muito curto: {len(y)} amostras")
+    if int(sr) != 16000:
+        _asr_transcribe_log(f"LOAD ASR: resample {int(sr)} -> 16000")
+        y = _resample_mono_f32_inmemory(y, int(sr), 16000)
+        sr = 16000
+    return y, int(sr)
+
+
 def transcribe(ref_audio, language=None):
+    import traceback
+
     global asr_pipe
     if asr_pipe is None:
+        _asr_transcribe_log("transcribe: a inicializar pipeline Whisper (pode demorar na 1.ª vez)…")
         initialize_asr_pipeline(device=device)
-    return asr_pipe(
-        ref_audio,
-        chunk_length_s=30,
-        batch_size=128,
-        generate_kwargs={"task": "transcribe", "language": language} if language else {"task": "transcribe"},
-        return_timestamps=False,
-    )["text"].strip()
+
+    # --- Paths locais: NUNCA passar str ao pipeline (evita open+ffmpeg_read e o ValueError falso "soundfile"). ---
+    if isinstance(ref_audio, (str, os.PathLike)):
+        raw_s = str(ref_audio)
+        p = os.path.abspath(os.path.normpath(raw_s))
+        _asr_transcribe_log(
+            f"transcribe: entrada str/Path | raw={raw_s!r} | abspath={p!r} | isfile={os.path.isfile(p)}"
+        )
+        if raw_s.startswith("http://") or raw_s.startswith("https://"):
+            # URL: o HF pipeline trata; não forçar dict
+            ref_audio = raw_s
+            _asr_transcribe_log("transcribe: URL — deixar pipeline tratar o URL")
+        elif os.path.isfile(p):
+            _asr_transcribe_log(
+                "transcribe: ficheiro local — _load_mono_16k (soundfile → stdlib.wave → torchaudio; NÃO librosa.load no path)"
+            )
+            y, sr = _load_mono_16k_for_asr(p)
+            y = np.ascontiguousarray(np.asarray(y, dtype=np.float32), dtype=np.float32)
+            ref_audio = {"raw": y, "sampling_rate": int(sr)}
+            _asr_transcribe_log(
+                f"transcribe: dict pronto | raw len={len(y)} sr={sr} dtype={y.dtype}"
+            )
+        else:
+            # Se isto acontecer, passar str ao pipeline quase certamente dá o erro falso "soundfile"
+            msg = f"transcribe: ficheiro inexistente — não vou passar str ao ASR: {p!r}"
+            _asr_transcribe_log(msg)
+            raise FileNotFoundError(p)
+
+    if isinstance(ref_audio, dict) and "raw" in ref_audio:
+        r = ref_audio["raw"]
+        if hasattr(r, "shape"):
+            r = np.ascontiguousarray(np.asarray(r, dtype=np.float32), dtype=np.float32)
+        ref_audio = {**ref_audio, "raw": r}
+
+    gen_kwargs = {"task": "transcribe"}
+    if language:
+        lang = str(language).strip().lower()
+        _lang_map = {
+            "portuguese": "pt",
+            "pt-br": "pt",
+            "pt_br": "pt",
+            "brazilian portuguese": "pt",
+            "english": "en",
+            "spanish": "es",
+            "french": "fr",
+            "german": "de",
+            "italian": "it",
+            "japanese": "ja",
+            "korean": "ko",
+            "chinese": "zh",
+        }
+        gen_kwargs["language"] = _lang_map.get(lang, lang)
+    if isinstance(ref_audio, str) and not (
+        ref_audio.startswith("http://") or ref_audio.startswith("https://")
+    ):
+        _asr_transcribe_log("transcribe: [BUG] ainda str local antes do pipeline — isto não devia acontecer")
+        raise TypeError("ref_audio ainda path local em str; lógica acima deveria converter para dict")
+
+    def _pipe_call(inp):
+        return asr_pipe(
+            inp,
+            chunk_length_s=0,
+            batch_size=1,
+            generate_kwargs=gen_kwargs,
+            return_timestamps=False,
+        )["text"].strip()
+
+    def _bypass_pipeline_generate(d: dict) -> str:
+        """
+        Não passa por AutomaticSpeechRecognitionPipeline.__call__ (dataloader/ffmpeg_read).
+        Preferir `processor` (Whisper) alinhado com o modelo; depois `feature_extractor` + `model.generate`.
+        Útil quando o pipeline levanta o falso "Soundfile" (ffmpeg_read).
+        """
+        y = np.ascontiguousarray(
+            np.asarray(
+                d.get("raw", d.get("array")),
+                dtype=np.float32,
+            ).reshape(-1)
+        )
+        sr = int(d["sampling_rate"])
+        p = asr_pipe
+        m = p.model
+        proc = getattr(p, "processor", None)
+        fe = p.feature_extractor
+        with torch.inference_mode():
+            input_features = None
+            if proc is not None and callable(proc):
+                try:
+                    out = proc(
+                        y,
+                        sampling_rate=sr,
+                        return_tensors="pt",
+                    )
+                    if hasattr(out, "get"):
+                        input_features = out["input_features"]
+                    elif hasattr(out, "input_features"):
+                        input_features = out.input_features
+                except Exception:  # noqa: BLE001
+                    input_features = None
+            if input_features is None and fe is not None:
+                proc_out = fe(
+                    y,
+                    sampling_rate=sr,
+                    return_tensors="pt",
+                    padding="longest",
+                    return_attention_mask=True,
+                )
+                if isinstance(proc_out, dict):
+                    input_features = proc_out["input_features"]
+                else:
+                    input_features = getattr(proc_out, "input_features", None) or proc_out[0]
+            if input_features is None:
+                raise RuntimeError("bypass: sem input_features a partir de processor ou feature_extractor")
+            if input_features.dim() == 2:
+                input_features = input_features.unsqueeze(0)
+            input_features = input_features.to(device=m.device, dtype=torch.float32)
+
+        lang = gen_kwargs.get("language")
+        tsk = gen_kwargs.get("task", "transcribe")
+        tok = getattr(p, "tokenizer", None)
+        if tok is None and proc is not None:
+            tok = getattr(proc, "tokenizer", None)
+        gkw: dict = {"max_new_tokens": 444}
+        pids = None
+        if proc is not None and hasattr(proc, "get_decoder_prompt_ids"):
+            try:
+                pids = proc.get_decoder_prompt_ids(
+                    language=lang,
+                    task=tsk or "transcribe",
+                )
+            except Exception as e_pid:  # noqa: BLE001
+                _asr_transcribe_log(
+                    f"bypass: get_decoder_prompt_ids: {e_pid!r} — tento tokenizer ou task/language no generate"
+                )
+        if pids is None and proc is not None:
+            toka = getattr(proc, "tokenizer", None)
+            if toka is not None and hasattr(toka, "get_decoder_prompt_ids"):
+                try:
+                    pids = toka.get_decoder_prompt_ids(
+                        language=lang,
+                        task=tsk or "transcribe",
+                    )
+                except Exception:  # noqa: BLE001
+                    pids = None
+        if pids is not None:
+            gkw["forced_decoder_ids"] = pids
+        elif tsk is not None or lang is not None:
+            if tsk is not None:
+                gkw["task"] = tsk
+            if lang is not None:
+                gkw["language"] = lang
+        with torch.inference_mode():
+            try:
+                out_ids = m.generate(input_features, **gkw)
+            except (TypeError, ValueError) as e_gen:
+                gkw2 = {k: v for k, v in gkw.items() if k not in ("task", "language", "forced_decoder_ids")}
+                gkw2.setdefault("max_new_tokens", 444)
+                _asr_transcribe_log(
+                    f"bypass: model.generate c/kwargs {list(gkw)} falhou ({e_gen!r}) — retentar só {list(gkw2)}"
+                )
+                out_ids = m.generate(input_features, **gkw2)
+        if tok is None:
+            raise RuntimeError("Whisper: pipeline sem tokenizer para decode direto")
+        return tok.decode(out_ids[0], skip_special_tokens=True).strip()
+
+    try:
+        _asr_transcribe_log(
+            f"transcribe: chamar asr_pipe | type={type(ref_audio)} | "
+            f"keys={list(ref_audio) if isinstance(ref_audio, dict) else 'n/a'}"
+        )
+        try:
+            text = _pipe_call(ref_audio)
+        except Exception as e0:
+            # Algumas versões HF aceitam só "array" (datasets) em vez de "raw"
+            if (
+                isinstance(ref_audio, dict)
+                and "raw" in ref_audio
+                and "sampling_rate" in ref_audio
+            ):
+                _asr_transcribe_log(
+                    f"transcribe: asr_pipe falhou ({e0!r}) — retentar com chave 'array' em vez de 'raw'"
+                )
+                alt = {
+                    "array": ref_audio["raw"],
+                    "sampling_rate": ref_audio["sampling_rate"],
+                }
+                text = _pipe_call(alt)
+            else:
+                raise
+        _asr_transcribe_log(f"transcribe: asr_pipe OK | chars={len(text)}")
+        return text
+    except Exception as e:
+        err = f"{e}"
+        _asr_transcribe_log(f"transcribe: asr_pipe FATAL {type(e).__name__}: {e}")
+        # Bypass total: a mensagem falsa "Soundfile" vem de audio_utils.ffmpeg_read dentro do __call__ do pipeline
+        if (
+            isinstance(ref_audio, dict)
+            and "sampling_rate" in ref_audio
+            and ("raw" in ref_audio or "array" in ref_audio)
+            and _looks_like_hf_ffmpeg_read_error(err)
+        ):
+            _asr_transcribe_log("transcribe: fallback generate direto (feature_extractor + model) — evita o pipeline()")
+            try:
+                d = {
+                    "raw": ref_audio.get("raw", ref_audio.get("array")),
+                    "sampling_rate": int(ref_audio["sampling_rate"]),
+                }
+                text = _bypass_pipeline_generate(d)
+                _asr_transcribe_log(
+                    f"transcribe: bypass OK | chars={len(text)} (se vir isto, o pipeline() estava a falhar no host)"
+                )
+                return text
+            except Exception as e2:  # noqa: BLE001
+                _asr_transcribe_log(
+                    f"transcribe: bypass FATAL {type(e2).__name__}: {e2!r} — a seguir re-lanço isto (não o falso 'Soundfile')"
+                )
+                traceback.print_exc()
+                raise e2 from e
+        if _looks_like_hf_ffmpeg_read_error(err):
+            _asr_transcribe_log(
+                "DICA: mensagem 'Soundfile' muitas vezes é de ffmpeg_read (HF), não do ficheiro. "
+                "Foi tentado generate direto; se ainda falhar, vê o traceback. "
+                "Reinicia a app; confirma [F5TTS-BOOT] e que não importas f5_tts antigo do site-packages."
+            )
+        traceback.print_exc()
+        raise
 
 
 # load model checkpoint for inference

@@ -1,13 +1,17 @@
 import argparse
+import json
 import os
 import shutil
+import sys
+from datetime import datetime
+from importlib.resources import files
 
 import torch
 from cached_path import cached_path
-from f5_tts.model import CFM, UNetT, DiT, Trainer
-from f5_tts.model.utils import get_tokenizer
+from datasets import Dataset as Dataset_
+from f5_tts.model import CFM, DiT, Trainer, UNetT
 from f5_tts.model.dataset import load_dataset
-from importlib.resources import files
+from f5_tts.model.utils import get_tokenizer
 
 
 # -------------------------- Dataset Settings --------------------------- #
@@ -17,6 +21,87 @@ hop_length = 256
 win_length = 1024
 n_fft = 1024
 mel_spec_type = "vocos"  # 'vocos' or 'bigvgan'
+
+
+def _configure_stdio_for_live_logs() -> None:
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(line_buffering=True)
+            except (OSError, ValueError, AttributeError):
+                pass
+
+
+class _StreamTee:
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+        return len(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
+def _dataset_stats(dataset_name: str, tokenizer: str) -> dict:
+    data_suffix = "char" if tokenizer == "custom" else tokenizer
+    rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{data_suffix}"))
+    stats = {
+        "data_path": rel_data_path,
+        "total_read": 0,
+        "total_used_estimate": 0,
+        "total_discarded": 0,
+        "discard_reasons": {
+            "duration_out_of_range_(<0.3_or_>30s)": 0,
+            "missing_audio_file": 0,
+        },
+    }
+    raw_arrow = os.path.join(rel_data_path, "raw.arrow")
+    if not os.path.isfile(raw_arrow):
+        stats["note"] = f"raw.arrow not found at {raw_arrow}"
+        return stats
+    try:
+        ds = Dataset_.from_file(raw_arrow)
+        stats["total_read"] = len(ds)
+        used = 0
+        missing_audio = 0
+        for row in ds:
+            duration = float(row.get("duration", 0))
+            if not (0.3 <= duration <= 30):
+                stats["discard_reasons"]["duration_out_of_range_(<0.3_or_>30s)"] += 1
+                continue
+            audio_path = row.get("audio_path", "")
+            if not audio_path or not os.path.isfile(audio_path):
+                missing_audio += 1
+                continue
+            used += 1
+        stats["discard_reasons"]["missing_audio_file"] = missing_audio
+        stats["total_used_estimate"] = used
+        stats["total_discarded"] = stats["total_read"] - used
+    except Exception as e:  # noqa: BLE001
+        stats["note"] = f"failed to compute detailed stats: {type(e).__name__}: {e}"
+    return stats
+
+
+def _artifact_checklist(checkpoint_path: str) -> dict:
+    exp_dir = os.path.join(checkpoint_path, "experiment_report")
+    samples_dir = os.path.join(checkpoint_path, "samples")
+    graphics_dir = os.path.join(checkpoint_path, "graphics")
+    has_samples = os.path.isdir(samples_dir) and any(p.endswith("_gen.wav") for p in os.listdir(samples_dir))
+    return {
+        "checkpoint_or_adapter_final": os.path.isfile(os.path.join(checkpoint_path, "model_last.pt")),
+        "tempo_medio_por_epoca": os.path.isfile(os.path.join(exp_dir, "statistics_summary.json")),
+        "tempo_medio_por_step": os.path.isfile(os.path.join(exp_dir, "statistics_summary.json")),
+        "grafico_perda_por_epoca": os.path.isfile(os.path.join(graphics_dir, "loss_by_epoch.png"))
+        or os.path.isfile(os.path.join(exp_dir, "loss_by_epoch.png")),
+        "grafico_perda_por_step": os.path.isfile(os.path.join(graphics_dir, "loss.png"))
+        or os.path.isfile(os.path.join(exp_dir, "loss.png")),
+        "inferencia_por_checkpoint_salvo": has_samples,
+    }
 
 
 # -------------------------- Argument Parsing --------------------------- #
@@ -77,6 +162,30 @@ def parse_args():
         action="store_true",
         help="Use 8-bit Adam optimizer from bitsandbytes",
     )
+    parser.add_argument(
+        "--experiment_report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write CSV/JSON reports under ckpts/<dataset>/experiment_report.",
+    )
+    parser.add_argument(
+        "--experiment_log_every_n",
+        type=int,
+        default=1,
+        help="Write timing/loss entries every N steps.",
+    )
+    parser.add_argument(
+        "--log_samples_every_n_epochs",
+        type=int,
+        default=0,
+        help="Generate sample inference every N epochs (0=disabled).",
+    )
+    parser.add_argument(
+        "--checkpoint_max_keep",
+        type=int,
+        default=10,
+        help="Max numbered checkpoints to keep (0=no limit).",
+    )
 
     return parser.parse_args()
 
@@ -85,10 +194,38 @@ def parse_args():
 
 
 def main():
+    _configure_stdio_for_live_logs()
     args = parse_args()
-    print("[finetune_cli] Starting finetune...", flush=True)
-
     checkpoint_path = str(files("f5_tts").joinpath(f"../../ckpts/{args.dataset_name}"))
+    os.makedirs(checkpoint_path, exist_ok=True)
+    train_log_path = os.path.join(checkpoint_path, "train.log")
+    train_log = open(train_log_path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = _StreamTee(sys.stdout, train_log)
+    sys.stderr = _StreamTee(sys.stderr, train_log)
+
+    run_name = f"{args.exp_name}_{args.dataset_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    print("[finetune_cli] Starting finetune...", flush=True)
+    print(f"[finetune_cli] train.log: {train_log_path}", flush=True)
+    print(f"[finetune_cli] run_name: {run_name}", flush=True)
+    print(f"[finetune_cli] base_model: {args.exp_name}", flush=True)
+    print(
+        f"[finetune_cli] base_checkpoint: {args.pretrain if args.pretrain else 'HF default (if --finetune) / random init'}",
+        flush=True,
+    )
+    print(
+        "[finetune_cli] hyperparams: "
+        f"epochs={args.epochs}, learning_rate={args.learning_rate}, batch_size_per_gpu={args.batch_size_per_gpu}, "
+        f"grad_accumulation_steps={args.grad_accumulation_steps}, max_samples={args.max_samples}, "
+        f"batch_size_type={args.batch_size_type}, max_seq_len=NA",
+        flush=True,
+    )
+    print(
+        "[finetune_cli] tts_config: "
+        f"vocoder={mel_spec_type}, sample_rate={target_sample_rate}, snac_repo_device=NA, text_loss_mask=NA",
+        flush=True,
+    )
+    ds_stats = _dataset_stats(args.dataset_name, args.tokenizer)
+    print("[finetune_cli] dataset_stats: " + json.dumps(ds_stats, ensure_ascii=False), flush=True)
 
     # Model parameters based on experiment name
     if args.exp_name == "F5TTS_Base":
@@ -193,6 +330,10 @@ def main():
         last_per_steps=args.last_per_steps,
         save_every_epochs=args.save_every_epochs,
         bnb_optimizer=args.bnb_optimizer,
+        experiment_report=args.experiment_report,
+        experiment_log_every_n_steps=args.experiment_log_every_n,
+        log_samples_every_n_epochs=args.log_samples_every_n_epochs,
+        checkpoint_max_keep=args.checkpoint_max_keep,
     )
 
     print("[finetune_cli] Loading dataset (this may take a while)...", flush=True)
@@ -203,6 +344,14 @@ def main():
         train_dataset,
         resumable_with_seed=666,  # seed for shuffling dataset
     )
+
+    checklist = _artifact_checklist(checkpoint_path)
+    print("[finetune_cli] artifact_checklist_final: " + json.dumps(checklist, ensure_ascii=False), flush=True)
+    missing = [k for k, v in checklist.items() if not v]
+    if missing:
+        print("[finetune_cli] artifact_checklist_status: MISSING -> " + ", ".join(missing), flush=True)
+    else:
+        print("[finetune_cli] artifact_checklist_status: OK (all expected artifacts present)", flush=True)
 
 
 if __name__ == "__main__":

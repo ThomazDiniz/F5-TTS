@@ -30,21 +30,34 @@ class _StderrFilter:
     def __getattr__(self, name):
         return getattr(self._stderr, name)
 sys.stderr = _StderrFilter(sys.stderr)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+logger = logging.getLogger(__name__)
 
 import click
 import gradio as gr
-import librosa
 import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 from datasets import Dataset as Dataset_
 from datasets.arrow_writer import ArrowWriter
 from safetensors.torch import save_file
-from scipy.io import wavfile
 from cached_path import cached_path
 from f5_tts.api import F5TTS
 from f5_tts.model.utils import convert_char_to_pinyin
-from f5_tts.infer.utils_infer import transcribe
+import f5_tts.infer.utils_infer as _f5_utils_infer
+
+print(
+    f"[F5TTS-BOOT] utils_infer={_f5_utils_infer.__file__}",
+    flush=True,
+    file=sys.stderr,
+)
+from f5_tts.infer.utils_infer import load_wav_path_mono_f32, transcribe
 from importlib.resources import files
 
 
@@ -697,6 +710,36 @@ def get_list_projects():
     return project_list, projects_selelect
 
 
+def _describe_transcribe_file_arg(audio_files) -> str:
+    """Short debug summary of Gradio File / upload input (paths truncated; no file reads)."""
+    if audio_files is None:
+        return "None"
+    if isinstance(audio_files, (list, tuple)):
+        if not audio_files:
+            return "empty list/tuple"
+        parts = []
+        for i, item in enumerate(audio_files[:8]):
+            p = getattr(item, "name", item)
+            if str(p).startswith("<gradio"):
+                parts.append(f"{i}=<gradio object>")
+            else:
+                parts.append(f"{i}={str(p)[:160]!r}")
+        if len(audio_files) > 8:
+            parts.append(f"...+{len(audio_files) - 8} more")
+        return f"list(len={len(audio_files)}): " + " | ".join(parts)
+    p = getattr(audio_files, "name", audio_files)
+    if str(p).startswith("<gradio"):
+        return "<gradio object>"
+    return f"single={str(p)[:240]!r}"
+
+
+def _safe_file_size(path: str):
+    try:
+        return os.path.getsize(path)
+    except OSError as e:
+        return f"err:{e!r}"
+
+
 def create_data_project(name, tokenizer_type):
     name += "_" + tokenizer_type
     os.makedirs(os.path.join(path_data, name), exist_ok=True)
@@ -706,22 +749,65 @@ def create_data_project(name, tokenizer_type):
 
 
 def transcribe_all(name_project, audio_files, language, user=False, progress=gr.Progress()):
+    def _is_gradio_progress_like(x):
+        try:
+            cls = x.__class__
+            if cls.__name__ == "Progress" and str(cls.__module__).startswith("gradio"):
+                return True
+        except Exception:
+            pass
+        return str(x).startswith("<gradio.helpers.Progress object")
+
+    logger.info(
+        "[TRANSCRIBE] start | project=%r | user(raw)=%r | language(raw)=%r | audio_input=%s",
+        name_project,
+        user,
+        language,
+        _describe_transcribe_file_arg(audio_files),
+    )
+    # Some Gradio 3.x callback paths may pass Progress in unexpected argument positions.
+    if _is_gradio_progress_like(audio_files):
+        logger.warning("[TRANSCRIBE] re-bound: audio_files was Progress; moved to progress= kw")
+        progress = audio_files
+        audio_files = None
+    if _is_gradio_progress_like(language):
+        logger.warning("[TRANSCRIBE] re-bound: language was Progress; set language=portuguese, moved to progress= kw")
+        progress = language
+        language = "portuguese"
+    if _is_gradio_progress_like(user):
+        logger.warning("[TRANSCRIBE] re-bound: user was Progress; set user=False, moved to progress= kw")
+        progress = user
+        user = False
+
+    language = (str(language).strip() if language is not None else "") or "portuguese"
+    user = bool(user)
+
     path_project = os.path.join(path_data, name_project)
     path_dataset = os.path.join(path_project, "dataset")
     path_project_wavs = os.path.join(path_project, "wavs")
     file_metadata = os.path.join(path_project, "metadata.csv")
+    logger.info(
+        "[TRANSCRIBE] resolved | user=%s | language=%r | path_project=%s | path_dataset=%s | wavs_out=%s | metadata=%s | dataset_dir_exists=%s",
+        user,
+        language,
+        path_project,
+        path_dataset,
+        path_project_wavs,
+        file_metadata,
+        os.path.isdir(path_dataset),
+    )
 
-    if not user:
-        if audio_files is None:
-            yield "You need to load an audio file."
-            return
+    if not user and audio_files is None:
+        logger.error("[TRANSCRIBE] early exit: upload mode but no audio files (ch_manual/Audio from Path is off).")
+        yield "You need to load an audio file."
+        return
 
     if os.path.isdir(path_project_wavs):
+        logger.info("[TRANSCRIBE] removing existing wavs dir: %s", path_project_wavs)
         shutil.rmtree(path_project_wavs)
-
     if os.path.isfile(file_metadata):
+        logger.info("[TRANSCRIBE] removing existing metadata: %s", file_metadata)
         os.remove(file_metadata)
-
     os.makedirs(path_project_wavs, exist_ok=True)
 
     if user:
@@ -730,11 +816,100 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
             for format in ("*.wav", "*.ogg", "*.opus", "*.mp3", "*.flac")
             for file in glob(os.path.join(path_dataset, format))
         ]
-        if file_audios == []:
+        logger.info("[TRANSCRIBE] dataset_path mode: glob found %d files under %s", len(file_audios), path_dataset)
+        if not file_audios:
+            logger.error("[TRANSCRIBE] early exit: no audio in dataset folder.")
             yield "No audio file was found in the dataset."
             return
     else:
         file_audios = audio_files
+        logger.info(
+            "[TRANSCRIBE] upload mode: file_audios type=%s after assignment",
+            type(file_audios).__name__,
+        )
+
+    if not isinstance(file_audios, (list, tuple)):
+        file_audios = [file_audios]
+        logger.info("[TRANSCRIBE] wrapped non-list file_audios into single-item list")
+
+    # Upload via Gradio: cap so the UI/loop stays reasonable. "Audio from Path" uses a glob — process all.
+    _upload_max = 1000
+    if user:
+        _to_normalize = file_audios
+    else:
+        n_in = len(file_audios)
+        if n_in > _upload_max:
+            logger.warning(
+                "[TRANSCRIBE] upload mode: processing first %d of %d files (Gradio upload cap).",
+                _upload_max,
+                n_in,
+            )
+        _to_normalize = file_audios[:_upload_max]
+
+    normalized_audio_files = []
+    skipped_progress_like = 0
+    for item in _to_normalize:
+        if _is_gradio_progress_like(item):
+            skipped_progress_like += 1
+            continue
+        candidate = getattr(item, "name", item)
+        if candidate is None:
+            logger.debug("[TRANSCRIBE] skip item: .name is None (upload temp gone?)")
+            continue
+        if _is_gradio_progress_like(candidate):
+            skipped_progress_like += 1
+            continue
+        candidate = str(candidate)
+        if candidate.startswith("<gradio.helpers.Progress object"):
+            skipped_progress_like += 1
+            continue
+        if not os.path.isfile(candidate):
+            logger.warning(
+                "[TRANSCRIBE] skip: not a file (missing or not regular): %r",
+                candidate[:300],
+            )
+            continue
+        normalized_audio_files.append(candidate)
+
+    file_audios = list(dict.fromkeys(normalized_audio_files))
+    if skipped_progress_like:
+        logger.warning(
+            "[TRANSCRIBE] ignored %d Progress-like entries from file input; check Gradio event wiring.",
+            skipped_progress_like,
+        )
+    # Fallback: when upload binding is broken (progress objects instead of files),
+    # use dataset folder files automatically if available.
+    if not file_audios:
+        dataset_fallback = [
+            file
+            for format in ("*.wav", "*.ogg", "*.opus", "*.mp3", "*.flac")
+            for file in glob(os.path.join(path_dataset, format))
+        ]
+        if dataset_fallback:
+            file_audios = sorted(dataset_fallback)
+            logger.warning(
+                "[TRANSCRIBE] upload invalid/empty; dataset fallback: %d files from %s",
+                len(file_audios),
+                path_dataset,
+            )
+    logger.info(
+        "[TRANSCRIBE] file queue | mode=%s | count=%d",
+        "dataset_path" if user else "upload",
+        len(file_audios),
+    )
+    if file_audios:
+        for i, p in enumerate(file_audios[:5]):
+            logger.info("[TRANSCRIBE]   queue[%d] %s (exists=%s, size=%s)", i, p, os.path.isfile(p), _safe_file_size(p))
+        if len(file_audios) > 5:
+            logger.info("[TRANSCRIBE]   ... and %d more", len(file_audios) - 5)
+    if not file_audios:
+        logger.error(
+            "[TRANSCRIBE] early exit: no valid file paths | user=%s | described_input=%s",
+            user,
+            _describe_transcribe_file_arg(audio_files) if not user else f"dataset (glob already empty? path_dataset={path_dataset!r})",
+        )
+        yield "No valid audio file was provided (upload files or use 'Audio from Path')."
+        return
 
     alpha = 0.5
     _max = 1.0
@@ -742,43 +917,195 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
 
     num = 0
     error_num = 0
-    error_details = []  # list of (file_segment, error_msg) for logging and summary
-    max_errors_logged = 20  # cap detailed errors in return message
+    error_details = []
+    max_errors_logged = 20
     data = ""
+    logger.info(
+        "[TRANSCRIBE] pipeline ready: slicer_sr=24000 | STT language=%r | out_wavs=%s | out_metadata=%s",
+        language,
+        path_project_wavs,
+        file_metadata,
+    )
     yield "Starting transcription..."
-    for file_audio in progress.tqdm(file_audios, desc="transcribe files", total=len((file_audios))):
-        audio, _ = librosa.load(file_audio, sr=24000, mono=True)
+    total_files = len(file_audios)
+    for idx, file_audio in enumerate(file_audios, start=1):
+        pct_files = (idx - 1) / max(total_files, 1) * 100.0
+        yield f"Transcribing... {pct_files:.1f}% ({idx-1}/{total_files} arquivos concluídos)"
+        try:
+            progress((idx - 1) / max(total_files, 1), desc=f"transcribe files ({idx}/{total_files})")
+        except Exception as e:
+            logger.debug("[TRANSCRIBE] progress() failed (non-fatal): %r", e)
+        logger.info(
+            "[TRANSCRIBE] file %d/%d (%.1f%%) | load: %s | size=%s",
+            idx,
+            total_files,
+            pct_files,
+            file_audio,
+            _safe_file_size(str(file_audio)) if os.path.isfile(str(file_audio)) else "N/A",
+        )
+        if _is_gradio_progress_like(file_audio):
+            logger.warning(
+                "[TRANSCRIBE] main loop: skipped Progress-like at [%d/%d]: %r",
+                idx,
+                total_files,
+                file_audio,
+            )
+            continue
+        try:
+            # Não usar librosa.load no path: no Windows reproduz o ValueError falso "soundfile malformado"
+            # antes mesmo do STT (mesma stack pysoundfile). Usar o mesmo leitor que o ASR: utils_infer.
+            audio = load_wav_path_mono_f32(file_audio, 24000)
+        except Exception as e:  # noqa: BLE001
+            error_num += 1
+            err_msg = f"{type(e).__name__}: {e}"
+            logger.exception("Failed to load audio input %s: %s", file_audio, err_msg)
+            error_details.append((str(file_audio), err_msg))
+            yield f"Error loading audio {file_audio}: {err_msg}"
+            continue
 
+        logger.info("[TRANSCRIBE] loaded | samples=%d | duration_s≈%.3f", len(audio), len(audio) / 24000.0)
         list_slicer = slicer.slice(audio)
-        for chunk, start, end in progress.tqdm(list_slicer, total=len(list_slicer), desc="slicer files"):
+        n_seg = len(list_slicer)
+        logger.info("[TRANSCRIBE] slicer | segments=%d (source file above)", n_seg)
+        if n_seg == 0:
+            logger.warning(
+                "[TRANSCRIBE] slicer produced 0 segments — no STT for this file: %s",
+                file_audio,
+            )
+        total_slices = max(1, n_seg)
+        for slice_idx, (chunk, start, end) in enumerate(list_slicer, start=1):
+            try:
+                progress(
+                    (idx - 1 + (slice_idx / total_slices)) / max(total_files, 1),
+                    desc=f"slicer files ({idx}/{total_files}, {slice_idx}/{total_slices})",
+                )
+            except Exception as e:
+                logger.debug("[TRANSCRIBE] progress (slice) failed: %r", e)
             name_segment = os.path.join(f"segment_{num}")
             file_segment = os.path.join(path_project_wavs, f"{name_segment}.wav")
 
-            tmp_max = np.abs(chunk).max()
+            if chunk is None or len(chunk) < 32:
+                warn_msg = (
+                    f"skipping too-short/empty chunk for {file_segment} "
+                    f"(slice={slice_idx}/{total_slices}, len={0 if chunk is None else len(chunk)})"
+                )
+                logger.warning("[TRANSCRIBE] %s", warn_msg)
+                continue
+
+            tmp_max = float(np.abs(chunk).max()) if len(chunk) else 0.0
             if tmp_max > 1:
-                chunk /= tmp_max
-            chunk = (chunk / tmp_max * (_max * alpha)) + (1 - alpha) * chunk
-            wavfile.write(file_segment, 24000, (chunk * 32767).astype(np.int16))
+                chunk = chunk / tmp_max
+            elif tmp_max <= 1e-12:
+                # Silent/degenerate segment: keep zeros to avoid NaN from divide-by-zero.
+                chunk = np.zeros_like(chunk, dtype=np.float32)
+
+            if tmp_max > 1e-12:
+                chunk = (chunk / max(tmp_max, 1e-12) * (_max * alpha)) + (1 - alpha) * chunk
+
+            chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+            chunk = np.clip(chunk, -1.0, 1.0).astype(np.float32)
+            # Prefer soundfile over scipy.io.wavfile; some STT paths reject scipy-written WAVs on Windows
+            try:
+                sf.write(file_segment, chunk, 24000, format="WAV", subtype="PCM_16")
+            except Exception as e:  # noqa: BLE001
+                error_num += 1
+                err_msg = f"{type(e).__name__}: {e}"
+                log_msg = f"sf.write failed {file_segment}: {err_msg}"
+                logger.exception("[TRANSCRIBE] %s", log_msg)
+                error_details.append((file_segment, err_msg))
+                yield f"Error writing segment {file_segment}: {err_msg}"
+                continue
+            try:
+                _post_info = sf.info(file_segment)
+            except Exception as e:  # noqa: BLE001
+                error_num += 1
+                err_msg = f"{type(e).__name__}: {e}"
+                log_msg = f"invalid wav after write {file_segment}: {err_msg}"
+                logger.exception("[TRANSCRIBE] %s", log_msg)
+                error_details.append((file_segment, err_msg))
+                yield f"Error writing valid segment {file_segment}: {err_msg}"
+                continue
+            logger.info(
+                "[TRANSCRIBE] segment write ok | file=%s | slice=%d/%d | start=%s end=%s | tmp_max=%.6f | post_write_frames=%s sr=%s",
+                file_segment,
+                slice_idx,
+                total_slices,
+                start,
+                end,
+                tmp_max,
+                getattr(_post_info, "frames", "?"),
+                getattr(_post_info, "samplerate", "?"),
+            )
 
             try:
+                _abs_seg = os.path.abspath(file_segment)
+                try:
+                    _sz = os.path.getsize(_abs_seg)
+                except OSError as _oe:
+                    _sz = f"err:{_oe}"
+                logger.info(
+                    "[TRANSCRIBE][STT] calling transcribe() | relpath=%r | abspath=%r | bytes=%s | language=%r",
+                    file_segment,
+                    _abs_seg,
+                    _sz,
+                    language,
+                )
+                t_stt0 = time.perf_counter()
                 text = transcribe(file_segment, language)
-                text = text.lower().strip().replace('"', "")
+                t_stt1 = time.perf_counter()
+                text_raw = text
+                text = (text or "").lower().strip().replace('"', "")
+                if not text:
+                    logger.warning(
+                        "[TRANSCRIBE][STT] empty transcript | segment=%s | raw_type=%s | raw_repr=%r | time_s=%.3f",
+                        name_segment,
+                        type(text_raw).__name__,
+                        (str(text_raw) if text_raw is not None else None)[:500],
+                        t_stt1 - t_stt0,
+                    )
+                else:
+                    logger.info(
+                        "[TRANSCRIBE][STT] ok | segment=%s | chars=%d | time_s=%.3f | text_preview=%r",
+                        name_segment,
+                        len(text),
+                        t_stt1 - t_stt0,
+                        text[:200],
+                    )
 
                 data += f"{name_segment}|{text}\n"
-                print(f"[TRANSCRIBE] {name_segment}|{text}", flush=True)
+                logger.info("[TRANSCRIBE] row | %s|%s", name_segment, text)
                 yield f"Transcribed: {name_segment}|{text}"
-
                 num += 1
             except Exception as e:  # noqa: BLE001
                 error_num += 1
                 err_msg = f"{type(e).__name__}: {e}"
-                logging.exception("Transcribe failed for %s: %s", file_segment, err_msg)
+                log_msg = f"STT failed for {file_segment}: {err_msg}"
+                logger.exception("[TRANSCRIBE] %s", log_msg)
                 error_details.append((file_segment, err_msg))
-                print(f"[TRANSCRIBE][ERROR] {file_segment}: {err_msg}", flush=True)
                 yield f"Error transcribing {file_segment}: {err_msg}"
+
+    try:
+        progress(1.0, desc="transcribe files (done)")
+    except Exception as e:
+        logger.debug("[TRANSCRIBE] progress(final) failed: %r", e)
+    logger.info(
+        "[TRANSCRIBE] loop finished | segments_transcribed=%d | stt_error_count=%d | metadata_path=%s | metadata_bytes=%d",
+        num,
+        error_num,
+        file_metadata,
+        len(data.encode("utf-8-sig")) if data else 0,
+    )
+    yield "Transcribing... 100.0% (finalizado)"
 
     with open(file_metadata, "w", encoding="utf-8-sig") as f:
         f.write(data)
+    n_meta_rows = len([ln for ln in (data or "").splitlines() if "|" in ln and ln.strip()])
+    logger.info(
+        "[TRANSCRIBE] wrote metadata: %s | bytes=%d | rows≈%d (pipe-delimited lines)",
+        file_metadata,
+        len((data or "").encode("utf-8-sig")),
+        n_meta_rows,
+    )
 
     if error_num != 0:
         error_text = f"\nerror files : {error_num}"
@@ -790,6 +1117,12 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
     else:
         error_text = ""
 
+    logger.info(
+        "[TRANSCRIBE] complete | project=%r | path_wavs=%r | %s",
+        name_project,
+        path_project_wavs,
+        f"errors={error_num}" if error_num else "no_errors",
+    )
     yield f"transcribe complete samples : {num}\npath : {path_project_wavs}{error_text}"
 
 
@@ -1238,7 +1571,12 @@ def get_random_sample_transcribe(project_name):
     name_project = project_name
     path_project = os.path.join(path_data, name_project)
     file_metadata = os.path.join(path_project, "metadata.csv")
+    logger.info("[TRANSCRIBE] random sample | project=%r | metadata=%r", name_project, file_metadata)
     if not os.path.isfile(file_metadata):
+        logger.warning(
+            "[TRANSCRIBE] random sample: no metadata (run Transcribe first) | %s",
+            file_metadata,
+        )
         return "", None
 
     data = ""
@@ -1249,6 +1587,11 @@ def get_random_sample_transcribe(project_name):
     for item in data.split("\n"):
         sp = item.split("|")
         if len(sp) != 2:
+            if item.strip():
+                logger.debug(
+                    "[TRANSCRIBE] random sample: skip line (expected id|text): %r",
+                    item[:200],
+                )
             continue
 
         # fixed audio when it is absolute
@@ -1256,9 +1599,22 @@ def get_random_sample_transcribe(project_name):
         list_data.append([file_audio, sp[1]])
 
     if list_data == []:
+        logger.warning(
+            "[TRANSCRIBE] random sample: 0 valid rows in %s (file len=%d chars)",
+            file_metadata,
+            len(data),
+        )
         return "", None
 
     random_item = random.choice(list_data)
+    _fp, _txt = random_item[0], random_item[1]
+    _exists = os.path.isfile(_fp) if _fp else False
+    logger.info(
+        "[TRANSCRIBE] random sample picked | audio=%r | exists=%s | text_len=%d",
+        _fp,
+        _exists,
+        len(_txt) if _txt else 0,
+    )
 
     return random_item[1], random_item[0]
 
@@ -1284,10 +1640,26 @@ def infer(
     ref_text_in = (ref_text or "").strip()
     gen_text_in = (gen_text or "").strip()
     if (not ref_text_in or not gen_text_in) and ref_audio:
+        logger.info(
+            "[TRANSCRIBE][INFER] auto STT: empty ref/gen text; ref_audio type=%s path=%r",
+            type(ref_audio).__name__,
+            (ref_audio if isinstance(ref_audio, str) else str(ref_audio)[:200]),
+        )
         try:
+            t0 = time.perf_counter()
             stt_text = (transcribe(ref_audio, None) or "").strip()
+            logger.info(
+                "[TRANSCRIBE][INFER] auto STT ok in %.3fs | chars=%d | preview=%r",
+                time.perf_counter() - t0,
+                len(stt_text),
+                stt_text[:200],
+            )
         except Exception:
             stt_text = ""
+            logger.exception(
+                "[TRANSCRIBE][INFER] auto STT failed; continuing with empty stt_text | ref_audio=%r",
+                ref_audio,
+            )
         if stt_text:
             if not ref_text_in:
                 ref_text_in = stt_text
