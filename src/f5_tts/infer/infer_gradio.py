@@ -6,9 +6,12 @@ import os
 import re
 import sys
 import tempfile
+import base64
+import zipfile
 from collections import OrderedDict
 from glob import glob
 from importlib.resources import files
+from pathlib import Path
 
 # Suppress Gradio "please upgrade" message (we pin 3.x on purpose)
 class _StderrFilter:
@@ -48,6 +51,7 @@ def gpu_decorator(func):
 
 
 from f5_tts.model import DiT, UNetT
+from f5_tts.model.utils import seed_everything
 from f5_tts.infer.utils_infer import (
     load_vocoder,
     load_model,
@@ -60,6 +64,11 @@ from f5_tts.infer.utils_infer import (
 
 DEFAULT_TTS_MODEL = "F5-TTS"
 tts_model_choice = DEFAULT_TTS_MODEL
+DEFAULT_DEBUG_TEXT = """Hoje acordei cedo, preparei um café forte e organizei a mesa para estudar com calma.
+Enquanto o trem passava devagar, uma criança sorria e apontava para as nuvens alaranjadas.
+O pesquisador analisou os dados, escreveu um relatório objetivo e compartilhou as conclusões com a equipe.
+Estamos construindo uma rotina mais saudável, caminhando no bairro e cozinhando alimentos frescos todos os dias.
+A bibliotecária catalogou romances, dicionários e biografias, mantendo cada prateleira limpa e bem sinalizada."""
 
 DEFAULT_TTS_MODEL_CFG = [
     "hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors",
@@ -163,6 +172,7 @@ def infer(
     cross_fade_duration=0.15,
     nfe_step=32,
     speed=1,
+    seed=-1,
     show_info=gr.Info,
 ):
     if not ref_audio_orig:
@@ -191,6 +201,14 @@ def infer(
             custom_ema_model = load_custom(model[1], vocab_path=model[2], model_cfg=model[3])
             pre_custom_path = model[1]
         ema_model = custom_ema_model
+
+    if seed is not None:
+        try:
+            seed_i = int(seed)
+        except (TypeError, ValueError):
+            seed_i = -1
+        if seed_i >= 0:
+            seed_everything(seed_i)
 
     final_wave, final_sample_rate, combined_spectrogram = infer_process(
         ref_audio,
@@ -221,6 +239,18 @@ def infer(
     return (final_sample_rate, final_wave), spectrogram_path, ref_text
 
 
+def _model_output_tag(model_choice):
+    """Stable, filesystem-safe model tag for output file names."""
+    if isinstance(model_choice, str):
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", model_choice).lower()
+    if isinstance(model_choice, list) and len(model_choice) >= 2 and model_choice[0] == "Custom":
+        ckpt_path = str(model_choice[1])
+        parent = os.path.basename(os.path.dirname(ckpt_path)) or "custom"
+        stem = os.path.splitext(os.path.basename(ckpt_path))[0] or "model"
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", f"{parent}_{stem}").lower()
+    return "model"
+
+
 with gr.Blocks() as app_credits:
     gr.Markdown("""
 # Credits
@@ -231,11 +261,25 @@ with gr.Blocks() as app_credits:
 """)
 with gr.Blocks() as app_tts:
     gr.Markdown("# Batched TTS")
-    ref_audio_input = gr.Audio(
-        label="Reference Audio",
-        type="filepath",
+    with gr.Row():
+        ref_audio_input = gr.Audio(
+            label="Reference Audio",
+            type="filepath",
+        )
+        bt_use_default_ref = gr.Button("Use Default Audio PB_0991.wav", variant="secondary")
+
+    gen_text_input = gr.Textbox(
+        label="Text to Generate",
+        lines=10,
+        value=DEFAULT_DEBUG_TEXT,
+        info="Use one sentence per line. Each non-empty line is synthesized separately in order.",
     )
-    gen_text_input = gr.Textbox(label="Text to Generate", lines=10)
+    seed_input = gr.Number(
+        label="Seed (-1 random)",
+        value=-1,
+        precision=0,
+        info="Visible here for debugging. Use fixed value for reproducible runs.",
+    )
     generate_btn = gr.Button("Synthesize", variant="primary")
     with gr.Accordion("Advanced Settings", open=False):
         ref_text_input = gr.Textbox(
@@ -275,6 +319,10 @@ with gr.Blocks() as app_tts:
 
     audio_output = gr.Audio(label="Synthesized Audio")
     spectrogram_output = gr.Image(label="Spectrogram")
+    files_output = gr.Files(label="Generated sentence WAVs")
+    zip_output = gr.File(label="Download All Audios (.zip)")
+    debug_output = gr.Textbox(label="Run Info", lines=8)
+    sentence_players_html = gr.HTML(label="Sentence Players")
 
     @gpu_decorator
     def basic_tts(
@@ -285,18 +333,97 @@ with gr.Blocks() as app_tts:
         cross_fade_duration_slider,
         nfe_slider,
         speed_slider,
+        seed_input,
     ):
-        audio_out, spectrogram_path, ref_text_out = infer(
-            ref_audio_input,
-            ref_text_input,
-            gen_text_input,
-            tts_model_choice,
-            remove_silence,
-            cross_fade_duration=cross_fade_duration_slider,
-            nfe_step=nfe_slider,
-            speed=speed_slider,
-        )
-        return audio_out, spectrogram_path, ref_text_out
+        lines = [ln.strip() for ln in (gen_text_input or "").splitlines() if ln.strip()]
+        if not lines:
+            return gr.update(), gr.update(), ref_text_input, [], gr.update(), "No non-empty lines found.", "<p>No sentence players.</p>"
+
+        generated_segments = []
+        generated_files = []
+        spectrogram_path = None
+        ref_text_out = ref_text_input
+        sr_out = None
+        model_tag = _model_output_tag(tts_model_choice)
+        run_dir = Path(tempfile.mkdtemp(prefix=f"{model_tag}_"))
+        zip_path = None
+        info_lines = [
+            f"model={tts_model_choice}",
+            f"model_tag={model_tag}",
+            f"num_sentences={len(lines)}",
+            f"seed_input={int(seed_input) if seed_input is not None else -1}",
+            "sentence_players=dynamic_html",
+        ]
+
+        base_seed = int(seed_input) if seed_input is not None else -1
+        for idx, sentence in enumerate(lines, start=1):
+            line_seed = (base_seed + idx - 1) if base_seed >= 0 else -1
+            audio_out, spectrogram_path, ref_text_out = infer(
+                ref_audio_input,
+                ref_text_out,
+                sentence,
+                tts_model_choice,
+                remove_silence,
+                cross_fade_duration=cross_fade_duration_slider,
+                nfe_step=nfe_slider,
+                speed=speed_slider,
+                seed=line_seed,
+                show_info=print,
+            )
+            if audio_out is None:
+                continue
+            sr, audio_data = audio_out
+            sr_out = sr
+            generated_segments.append(audio_data)
+
+            out_path = run_dir / f"{model_tag}_line{idx:02d}.wav"
+            sf.write(str(out_path), audio_data, sr)
+            generated_files.append(str(out_path))
+            info_lines.append(
+                f"line_{idx:02d}: seed={line_seed} chars={len(sentence)} file={out_path.name}"
+            )
+
+        if not generated_segments:
+            return gr.update(), gr.update(), ref_text_out, [], gr.update(), "\n".join(info_lines + ["No audio generated."]), "<p>No sentence players.</p>"
+
+        final_audio = np.concatenate(generated_segments)
+        html_parts = ["<div><h4>Sentence Players</h4>"]
+        for idx, path in enumerate(generated_files, start=1):
+            try:
+                with open(path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                html_parts.append(
+                    f"<div style='margin-bottom:10px'><div><b>Sentence {idx:02d}</b></div>"
+                    f"<audio controls preload='none' src='data:audio/wav;base64,{b64}'></audio></div>"
+                )
+            except Exception as e:  # noqa: BLE001
+                html_parts.append(f"<div>Sentence {idx:02d}: failed to render player ({e})</div>")
+        html_parts.append("</div>")
+        players_html = "".join(html_parts)
+        zip_path = run_dir / f"{model_tag}_all_lines.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for path in generated_files:
+                p = Path(path)
+                zf.write(path, arcname=p.name)
+        info_lines.append(f"zip_file={zip_path.name}")
+        return (sr_out, final_audio), spectrogram_path, ref_text_out, generated_files, str(zip_path), "\n".join(info_lines), players_html
+
+    def set_default_reference_audio():
+        candidates = [
+            str(files("f5_tts").joinpath("../../PB_0991.wav")),
+            "/workspace/F5-TTS/PB_0991.wav",
+            "PB_0991.wav",
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c, "Fabiana hesitou, resmungou como fazia sempre que ele dirigia uma palavra."
+        gr.Warning("Default audio PB_0991.wav not found in workspace root.")
+        return gr.update(), gr.update()
+
+    bt_use_default_ref.click(
+        set_default_reference_audio,
+        outputs=[ref_audio_input, ref_text_input],
+    )
 
     generate_btn.click(
         basic_tts,
@@ -308,8 +435,9 @@ with gr.Blocks() as app_tts:
             cross_fade_duration_slider,
             nfe_slider,
             speed_slider,
+            seed_input,
         ],
-        outputs=[audio_output, spectrogram_output, ref_text_input],
+        outputs=[audio_output, spectrogram_output, ref_text_input, files_output, zip_output, debug_output, sentence_players_html],
     )
 
 
@@ -852,10 +980,14 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
         with open(last_used_custom, "w", encoding="utf-8") as f:
             f.write(custom_ckpt_path + "\n" + custom_vocab_path + "\n" + custom_model_cfg + "\n")
 
+    loaded_custom = load_last_used_custom()
+    if not USING_SPACES:
+        tts_model_choice = ["Custom", loaded_custom[0], loaded_custom[1], json.loads(loaded_custom[2])]
+
     with gr.Row():
         if not USING_SPACES:
             choose_tts_model = gr.Radio(
-                choices=[DEFAULT_TTS_MODEL, "E2-TTS", "Custom"], label="Choose TTS Model", value=DEFAULT_TTS_MODEL
+                choices=[DEFAULT_TTS_MODEL, "E2-TTS", "Custom"], label="Choose TTS Model", value="Custom"
             )
         else:
             choose_tts_model = gr.Radio(
@@ -863,27 +995,27 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
             )
         custom_ckpt_path = gr.Dropdown(
             choices=[DEFAULT_TTS_MODEL_CFG[0]] + _workspace_ckpt_choices(),
-            value=load_last_used_custom()[0],
+            value=loaded_custom[0],
             allow_custom_value=True,
             label="Model: local_path | hf://user_id/repo_id/model_ckpt",
-            visible=False,
+            visible=(not USING_SPACES),
         )
         custom_vocab_path = gr.Dropdown(
             choices=_workspace_vocab_choices(),
-            value=load_last_used_custom()[1] if load_last_used_custom()[1] in _workspace_vocab_choices() else (_path_default_vocab_local if os.path.isfile(_path_default_vocab_local) else DEFAULT_TTS_MODEL_CFG[1]),
+            value=loaded_custom[1] if loaded_custom[1] in _workspace_vocab_choices() else (_path_default_vocab_local if os.path.isfile(_path_default_vocab_local) else DEFAULT_TTS_MODEL_CFG[1]),
             allow_custom_value=True,
             label="Vocab: local_path | hf://user_id/repo_id/vocab_file",
-            visible=False,
+            visible=(not USING_SPACES),
         )
         custom_model_cfg = gr.Dropdown(
             choices=[
                 DEFAULT_TTS_MODEL_CFG[2],
                 json.dumps(dict(dim=768, depth=18, heads=12, ff_mult=2, text_dim=512, conv_layers=4)),
             ],
-            value=load_last_used_custom()[2],
+            value=loaded_custom[2],
             allow_custom_value=True,
             label="Config: in a dictionary form",
-            visible=False,
+            visible=(not USING_SPACES),
         )
 
     choose_tts_model.change(
